@@ -180,6 +180,14 @@ class FlexKVComm:
             if self.attn_cp_size > 1
             else []
         )
+        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
+            # Each DP replica can have a distinct (and nonzero-based) CP
+            # group. Only TP leaders relay between CP groups before TP fanout.
+            self._cp_leader_ranks = (
+                [dist.get_global_rank(self.attn_cp_cpu_group, i)
+                 for i in range(self.attn_cp_cpu_group.size())]
+                if self.is_tp_leader else []
+            )
         if self.attn_tp_size > 1:
             if self.attn_tp_cpu_group is None:
                 raise RuntimeError(
