@@ -89,7 +89,8 @@ def test_connector_compacts_skip_topk_indexer_group_for_ordinary_cp():
 
 
 @pytest.mark.parametrize("dedup", [False, True])
-def test_connector_resolves_only_the_selected_indexer_layout(dedup):
+@pytest.mark.parametrize("none_placeholder", [True, False])
+def test_connector_resolves_only_the_selected_indexer_layout(dedup, none_placeholder):
     connector = FlexKVConnector.__new__(FlexKVConnector)
     connector._is_dsv4 = False
     connector._deduplicate_indexer_group = dedup
@@ -105,6 +106,8 @@ def test_connector_resolves_only_the_selected_indexer_layout(dedup):
         skip_topk_layers=[False, True, False],
         layer_shard_enabled=False,
     )
+    if none_placeholder:
+        buffers[1] = None
     resolved, group = connector._resolve_kv_buffers(cache)
     assert resolved[0] is main
     assert group.logical_layer_count == 3
@@ -113,7 +116,10 @@ def test_connector_resolves_only_the_selected_indexer_layout(dedup):
     if not dedup:
         assert group.buffers[0] is group.buffers[1]
     # Resolution must not replace the pool's skip-layer placeholders.
-    assert cache.index_k_with_scale_buffer[1].shape[0] == 0
+    assert cache.index_k_with_scale_buffer[1] is buffers[1]
+    buffers[2] = None if none_placeholder else buffers[2][:0]
+    with pytest.raises(RuntimeError, match="active indexer layer.*has no physical buffer"):
+        connector._resolve_kv_buffers(cache)
 
 
 def test_connector_rejects_indexer_dedup_with_cp_layer_split():

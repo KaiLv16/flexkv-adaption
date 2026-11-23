@@ -2150,32 +2150,36 @@ class FlexKVConnector:
 
     @staticmethod
     def _alias_empty_indexer_buffers(
-        indexer_buffers: List[torch.Tensor],
+        indexer_buffers: Sequence[Optional[torch.Tensor]],
+        skip_topk_layers: Optional[Sequence[bool]] = None,
     ) -> List[torch.Tensor]:
-        """Replace skip-topk zero-row placeholders with their source layer.
+        """Replace skip-topk placeholders with their source layer.
 
-        SGLang intentionally allocates a ``(0, page_stride)`` tensor for a
-        skip-topk layer because that layer reuses the preceding layer's
-        indexer cache.  FlexKV keeps one physical indexer slot per model layer
-        (matching HiCache sizing), so its pointer table must alias the same
-        preceding buffer instead of exporting a null ``data_ptr()``.
+        A skip-topk layer can use a zero-row tensor or ``None`` to represent
+        the preceding layer's indexer cache. The full layout keeps its slot
+        and aliases the preceding buffer.
         """
+        if skip_topk_layers is not None and len(skip_topk_layers) != len(indexer_buffers):
+            raise ValueError("Expected one skip_topk entry per indexer layer")
         resolved: List[torch.Tensor] = []
         previous: Optional[torch.Tensor] = None
         alias_count = 0
         for layer_idx, buffer in enumerate(indexer_buffers):
-            if buffer.ndim != 2:
+            if buffer is not None and buffer.ndim != 2:
                 raise RuntimeError(
                     f"FlexKV indexer layer {layer_idx} expects a 2D buffer, "
                     f"got shape={tuple(buffer.shape)}"
                 )
-            if buffer.shape[0] == 0:
+            if buffer is None or buffer.shape[0] == 0:
+                if skip_topk_layers is not None and not skip_topk_layers[layer_idx]:
+                    raise RuntimeError(f"FlexKV active indexer layer {layer_idx} has no physical buffer")
+                if buffer is None and skip_topk_layers is None:
+                    raise RuntimeError(f"Missing skip_topk metadata for indexer layer {layer_idx}")
                 if previous is None:
                     raise RuntimeError(
-                        "FlexKV cannot alias a leading skip-topk indexer layer: "
-                        f"layer={layer_idx} has shape={tuple(buffer.shape)}"
+                        f"FlexKV cannot alias a leading skip-topk indexer layer: layer={layer_idx}"
                     )
-                if buffer.shape[1] != previous.shape[1]:
+                if buffer is not None and buffer.shape[1] != previous.shape[1]:
                     raise RuntimeError(
                         "FlexKV skip-topk indexer placeholder width mismatch: "
                         f"layer={layer_idx} width={buffer.shape[1]} "
@@ -2202,7 +2206,7 @@ class FlexKVConnector:
 
     @staticmethod
     def _compact_indexer_buffers(
-        indexer_buffers: Sequence[torch.Tensor],
+        indexer_buffers: Sequence[Optional[torch.Tensor]],
         skip_topk_layers: Sequence[bool],
         *,
         layer_shard_enabled: bool,
@@ -2233,6 +2237,10 @@ class FlexKVConnector:
         active_layer_indices: List[int] = []
         sample: Optional[torch.Tensor] = None
         for layer_idx, (buffer, skip_topk) in enumerate(zip(buffers, skip_mask, strict=True)):
+            if buffer is None:
+                if skip_topk:
+                    continue
+                raise RuntimeError(f"FlexKV active indexer layer {layer_idx} has no physical buffer")
             if buffer.ndim != 2:
                 raise RuntimeError(
                     f"FlexKV indexer layer {layer_idx} expects a 2D buffer, "
@@ -2281,10 +2289,11 @@ class FlexKVConnector:
         """Resolve the GPU buffers and describe heterogeneous DSv4 pools."""
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
         if indexer_buffers:
+            skip_topk_layers = getattr(kvcache, "skip_topk_layers", None)
             if self._deduplicate_indexer_group:
                 indexer_group = self._compact_indexer_buffers(
                     indexer_buffers,
-                    getattr(kvcache, "skip_topk_layers", ()),
+                    skip_topk_layers if skip_topk_layers is not None else (),
                     layer_shard_enabled=bool(
                         getattr(kvcache, "layer_shard_enabled", False)
                     ),
@@ -2298,7 +2307,7 @@ class FlexKVConnector:
                     list(indexer_group.layer_indices),
                 )
             else:
-                aliased = self._alias_empty_indexer_buffers(list(indexer_buffers))
+                aliased = self._alias_empty_indexer_buffers(indexer_buffers, skip_topk_layers)
                 indexer_group = _IndexerBufferGroup(
                     buffers=tuple(aliased),
                     layer_indices=tuple(range(len(aliased))),
