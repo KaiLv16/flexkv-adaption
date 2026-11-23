@@ -1363,7 +1363,7 @@ class FlexKVConnector:
     def store_kv(
         self,
         rid: str,
-        token_ids: List[int],
+        token_ids: Sequence[int],
         kv_indices: torch.Tensor,
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
@@ -1691,7 +1691,7 @@ class FlexKVConnector:
     def prefetch_async(
         self,
         rid: str,
-        token_ids: List[int],
+        token_ids: Sequence[int],
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
         *, candidate_start_token: int = 0,

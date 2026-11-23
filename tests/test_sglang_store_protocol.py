@@ -54,7 +54,7 @@ def test_store_start_tracks_task_on_nonleader_rank():
     }
     connector = _follower_connector(payload)
 
-    task_id = connector.store_kv("request", [1, 2, 3, 4], torch.arange(4, dtype=torch.int64))
+    task_id = connector.store_kv("request", range(1, 5), torch.arange(4, dtype=torch.int64))
 
     assert task_id == 17
     assert connector._inflight_stores == {"request": 17}
@@ -94,7 +94,7 @@ def test_store_leader_accepts_pinned_sideband_cpu_mapping():
     connector._log_cache_op = MagicMock()
     cpu_mapping = torch.tensor([4, 5, 8, 9], dtype=torch.int64)
 
-    assert connector.store_kv("request", [1, 2, 3, 4], cpu_mapping) == 17
+    assert connector.store_kv("request", np.arange(1, 5, dtype=np.int64), cpu_mapping) == 17
     launch = connector.kv_manager.launch.call_args.kwargs
     assert launch["slot_mappings"][0].tolist() == [4, 8]
     assert launch["swa_slot_mappings"] == [None]
