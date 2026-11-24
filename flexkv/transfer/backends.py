@@ -966,7 +966,12 @@ class MooncakeStoreBackend(StorageBackend):
             self.cache_config,
             override_global_segment_size=self.override_global_segment_size,
         )
-        self.mooncake_client = MooncakeStoreClient(store_config)
+        if os.getenv("FLEXKV_MOONCAKE_PARALLEL_IO", "0") == "1":
+            from flexkv.external.mooncake_parallel_io import ParallelMooncakeStoreClient
+
+            self.mooncake_client = ParallelMooncakeStoreClient(store_config)
+        else:
+            self.mooncake_client = MooncakeStoreClient(store_config)
         self._registered_regions = _register_mooncake_regions(
             self.mooncake_client, self._registration_regions(cpu))
         # One opaque value per block, so a block is exactly what is stored.
