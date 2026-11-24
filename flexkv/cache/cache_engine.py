@@ -1499,11 +1499,22 @@ class GlobalCacheEngine:
         assert enable_cpu and enable_remote
         assert self.cpu_cache_engine is not None
         assert self.remote_cache_engine is not None
-        if self.index_accel:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_cpu_ssd_remote_accel(
-                sequence_meta)
+        match = self.match_cpu_ssd_remote_accel if self.index_accel else self.match_cpu_ssd_remote
+        if self.use_mooncake_store_backend and not enable_gpu and not swa_aware:
+            local_strategy = replace(temp_cache_strategy, ignore_remote=True)
+            cpu_matched_result, ssd_matched_result, remote_matched_result = match(
+                sequence_meta, local_strategy
+            )
+            local_blocks = max(
+                cpu_matched_result.num_matched_blocks,
+                ssd_matched_result.num_matched_blocks,
+            )
+            if local_blocks < block_mask_end:
+                remote_matched_result = self.remote_cache_engine.match(
+                    sequence_meta, start_block=local_blocks
+                )
         else:
-            cpu_matched_result, ssd_matched_result, remote_matched_result = self.match_cpu_ssd_remote(sequence_meta)
+            cpu_matched_result, ssd_matched_result, remote_matched_result = match(sequence_meta)
         transfer_graph = TransferOpGraph()
         swa_reservation: Optional[SWAReadReservation] = None
         swa_read_source: SWAReadSource = SWAReadSource()

@@ -1007,7 +1007,7 @@ class MooncakeStoreCacheEngine:
     # Public interface (matches CacheEngineAccel)
     # ------------------------------------------------------------------
 
-    def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
+    def match(self, sequence_meta: SequenceMeta, *, start_block: int = 0) -> MatchResultAccel:
         """KV longest prefix + optional SWA tail joint hit (single RPC)."""
         n_blocks = sequence_meta.num_blocks
         if n_blocks == 0:
@@ -1021,8 +1021,13 @@ class MooncakeStoreCacheEngine:
                 matched_pos=self.MATCHED_POS,
             )
 
-        block_hashes = [str(sequence_meta.block_hashes[i]) for i in range(n_blocks)]
+        # The caller supplies a ready local prefix. Keep its hash chain while
+        # querying only the missing suffix, including every CP fragment.
+        start = min(max(start_block, 0), n_blocks) if start_block and not self._swa_enabled else 0
+        block_hashes = [str(sequence_meta.block_hashes[i]) for i in range(start, n_blocks)]
         joint_matched, kv_matched, swa_hit = self._joint_match_length(block_hashes)
+        joint_matched += start
+        kv_matched += start
 
         return MatchResultAccel(
             num_matched_blocks=joint_matched,

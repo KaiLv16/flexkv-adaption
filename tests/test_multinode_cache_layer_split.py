@@ -45,6 +45,22 @@ def test_partial_l3_fragments_terminate_prefix_in_one_rpc():
         [build_key(h, PoolKind.KV, cp_nodes=2, cp_node=r) for h in "abc" for r in range(2)])
 
 
+def test_mooncake_suffix_matches_after_ready_host_prefix():
+    from flexkv.external.mooncake_store_utils import MooncakeStoreCacheEngine
+
+    engine = object.__new__(MooncakeStoreCacheEngine)
+    engine.cp_nodes = 2
+    engine._swa_enabled = False
+    engine.mooncake_store_client = Mock()
+    engine.mooncake_store_client.batch_exists_impl.return_value = [1, 1, 1, 0]
+    sequence = SimpleNamespace(num_blocks=4, block_hashes=["a", "b", "c", "d"])
+
+    assert engine.match(sequence, start_block=2).num_matched_blocks == 3
+    engine.mooncake_store_client.batch_exists_impl.assert_called_once_with(
+        [build_key(h, PoolKind.KV, cp_nodes=2, cp_node=r) for h in "cd" for r in range(2)]
+    )
+
+
 @pytest.mark.parametrize("nodes,width", [(2, 8), (3, 2), (4, 1)])
 def test_each_node_round_trips_only_owned_bytes(nodes, width):
     from flexkv.common.transfer import TransferType
