@@ -16,7 +16,7 @@ from flexkv.common.config import ModelConfig, CacheConfig, LayerGroupSpec
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
-from flexkv.common.request import KVResponseStatus, KVResponse
+from flexkv.common.request import KVResponseStatus, KVResponse, PutMatchResult
 from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import (
     RegisterDPClientRequest,
@@ -173,17 +173,26 @@ class KVDPClient:
         token_ids: np.ndarray,
         token_mask: Optional[np.ndarray],
         namespace: Optional[List[str]] = None,
-    ) -> Optional[Tuple[int, np.ndarray]]:
+        *,
+        return_disposition: bool = False,
+    ) -> Optional[PutMatchResult]:
         req = PutMatchRequest(
             dp_client_id=self.dp_client_id,
             token_ids=token_ids,
             token_mask=token_mask if token_mask is not None else None,
             task_id=self._get_task_id(),
             namespace=namespace,
+            return_disposition=return_disposition,
         )
         self.send_to_server.send_pyobj(req)
         response: Response = self.recv_from_server.recv_pyobj()
         if response.error_msg is None:
+            if return_disposition:
+                if getattr(response, "put_disposition", None) is None:
+                    if response.task_id is not None and response.task_id >= 0:
+                        self.cancel_tasks([response.task_id])
+                    raise RuntimeError("FlexKV server did not return a PUT disposition")
+                return response.task_id, response.mask, response.put_disposition
             return response.task_id, response.mask
         else:
             flexkv_logger.error(f"put_match failed, error_msg: {response.error_msg}")

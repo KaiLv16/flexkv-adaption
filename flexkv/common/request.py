@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Tuple
 
 import torch
 import numpy as np
@@ -29,6 +29,19 @@ class KVResponseStatus(Enum):
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
     FAILED = "failed"
+
+
+class PutMatchDisposition(Enum):
+    """Whether a prepared PUT requires launch and which source it reads."""
+
+    ALREADY_CACHED = "already_cached"
+    SKIPPED = "skipped"
+    HOST_ONLY = "host_only"
+    READS_GPU = "reads_gpu"
+
+
+PutMatchResult = Union[Tuple[int, np.ndarray], Tuple[int, np.ndarray, PutMatchDisposition]]
+
 
 @dataclass
 class KVResponse:

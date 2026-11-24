@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from flexkv import c_ext
+from flexkv.common.request import PutMatchResult
 from flexkv.server.client import KVDPClient
 from flexkv.server.server import KVServer, DPClient
 from flexkv.kvtask import KVTaskEngine, KVResponse
@@ -302,22 +303,22 @@ class KVManager:
                   token_ids: Union[torch.Tensor, np.ndarray],
                   token_mask: Optional[Union[torch.Tensor, np.ndarray]] = None,
                   namespace: Optional[List[str]] = None,
-                  ) -> Tuple[int, np.ndarray]:
+                  *, return_disposition: bool = False,
+                  ) -> Optional[PutMatchResult]:
+        """Prepare a PUT, optionally reporting no work, Host-only, or GPU reads."""
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.numpy()
         if isinstance(token_mask, torch.Tensor):
             token_mask = token_mask.numpy()
         if self.server_client_mode:
-            task_id, mask = self.dp_client.put_match(token_ids, token_mask,
-                                                     namespace=namespace)
-        else:
-            task_id, mask = self.kv_task_engine.put_match(
-                token_ids=token_ids,
-                token_mask=token_mask,
-                dp_client_id=self.dp_client_id,
-                namespace=namespace,
+            return self.dp_client.put_match(
+                token_ids, token_mask, namespace=namespace,
+                return_disposition=return_disposition,
             )
-        return task_id, mask
+        return self.kv_task_engine.put_match(
+            token_ids=token_ids, token_mask=token_mask, dp_client_id=self.dp_client_id,
+            namespace=namespace, return_disposition=return_disposition,
+        )
 
     def prefetch_async(self,
                        token_ids: np.ndarray,

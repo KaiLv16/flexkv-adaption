@@ -14,14 +14,16 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from flexkv.common.request import PutMatchDisposition
 from flexkv.integration.sglang.comm import FlexKVComm
 from flexkv.integration.sglang.connector import FlexKVConnector
 
 
 class _FakeKVManager:
-    def put_match(self, *, token_ids, token_mask):
-        del token_mask
-        return 17, np.ones(len(token_ids), dtype=np.bool_)
+    def put_match(self, *, token_ids, token_mask, namespace, return_disposition):
+        del token_mask, namespace
+        assert return_disposition
+        return 17, np.ones(len(token_ids), dtype=np.bool_), PutMatchDisposition.READS_GPU
 
     def launch(self, **kwargs):
         del kwargs

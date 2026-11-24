@@ -56,7 +56,7 @@ from flexkv.common.config import (
     LayerGroupSpec,
     recompute_cache_block_counts,
 )
-from flexkv.common.request import KVResponseStatus
+from flexkv.common.request import KVResponseStatus, PutMatchDisposition
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.integration.config import FlexKVConfig, _is_sglang_dsv4
 from flexkv.kvmanager import KVManager
@@ -97,6 +97,13 @@ class _CacheOpContext:
     sglang_req_id: Optional[str]
     start_ns: int
     task_id: int = -1
+
+
+@dataclass(frozen=True)
+class FlexKVStoreResult:
+    task_id: int = -1
+    already_cached: bool = False
+    reads_gpu: bool = False
 
 
 @dataclass
@@ -1771,6 +1778,22 @@ class FlexKVConnector:
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
     ) -> int:
+        """Compatibility entry point for callers using a task ID."""
+        self._last_store_already_cached = False
+        result = self.store_kv_with_result(
+            rid, token_ids, kv_indices, sglang_req_id=sglang_req_id, namespace=namespace
+        )
+        self._last_store_already_cached = result.already_cached
+        return result.task_id
+
+    def store_kv_with_result(
+        self,
+        rid: str,
+        token_ids: Sequence[int],
+        kv_indices: torch.Tensor,
+        sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
+        namespace: Optional[List[str]] = None,
+    ) -> FlexKVStoreResult:
         """Schedule a write back from GPU into FlexKV.
 
         The sync leader runs ``put_match`` and ``launch``. Its result is
@@ -1778,9 +1801,9 @@ class FlexKVConnector:
         of the source GPU slots until the store completes. A remote PP
         stage leader also forwards its local slot mapping.
 
-        Returns the FlexKV task id of the in-flight store, or -1 if
-        nothing needed to be written. On StoreSubmissionUncertainError,
-        keep the source slots pinned until completion or reset.
+        The planner pins Host sources. For GPU readers, the caller must keep
+        source slots pinned until completion or reset. An uncertain submission
+        also retains the caller's slots until the backend is drained.
         """
         context = self._new_op_context("store", rid, sglang_req_id)
         with self._store_profile_scope("flexkv.connector.store.tokens_to_numpy"):
@@ -1800,7 +1823,7 @@ class FlexKVConnector:
                     context, "complete", "failed", direction="D2H",
                     stage="preflight", error="Invalid or different D2H slots across cache layer split ranks",
                 )
-                return -1
+                return FlexKVStoreResult()
         elif n != slot_count:
             raise ValueError(
                 f"store_kv: token_ids has {n} entries but kv_indices "
@@ -1819,7 +1842,7 @@ class FlexKVConnector:
                     reason="partial_block",
                     tokens=0,
                 )
-                return -1
+                return FlexKVStoreResult()
             if aligned_len < n:
                 token_ids_np = token_ids_np[:aligned_len]
                 kv_indices = kv_indices[:aligned_len]
@@ -1829,6 +1852,8 @@ class FlexKVConnector:
             "rid": rid,
             "task_id": -1,
             "active": False,
+            "already_cached": False,
+            "reads_gpu": False,
             "slot_count": n,
             "unmatched_count": 0,
             "unmatched_mask": [],
@@ -1839,7 +1864,8 @@ class FlexKVConnector:
             try:
                 with self._store_profile_scope("flexkv.connector.store.put_match"):
                     res = self.kv_manager.put_match(
-                        token_ids=token_ids_np, token_mask=None, namespace=self._cache_namespace(namespace)
+                        token_ids=token_ids_np, token_mask=None,
+                        namespace=self._cache_namespace(namespace), return_disposition=True,
                     )
             except Exception as exc:  # noqa: BLE001
                 match_error = exc
@@ -1855,7 +1881,8 @@ class FlexKVConnector:
                     error=str(match_error) if match_error is not None else None,
                 )
             else:
-                fkv_task_id, unmatched_mask = res
+                fkv_task_id, unmatched_mask, disposition = res
+                reads_gpu = disposition == PutMatchDisposition.READS_GPU
                 # TP/CP followers only need the task id to retain their local
                 # radix-node ownership.  Broadcasting one Python bool per
                 # prompt token made the common TP-only write-through path
@@ -1863,7 +1890,7 @@ class FlexKVConnector:
                 # request.  Only cross-node PP receivers need the mask to
                 # construct their stage-local slot mapping.
                 needs_remote_mask = bool(
-                    getattr(self._sync_ctx, "is_cross_node_pp", False)
+                    reads_gpu and getattr(self._sync_ctx, "is_cross_node_pp", False)
                 )
                 unmatched_count = int(np.count_nonzero(unmatched_mask))
                 mask_list = (
@@ -1875,34 +1902,34 @@ class FlexKVConnector:
                 )
                 store_start.update(
                     task_id=int(fkv_task_id),
+                    already_cached=disposition == PutMatchDisposition.ALREADY_CACHED,
+                    reads_gpu=reads_gpu,
                     unmatched_count=unmatched_count,
                     unmatched_mask=mask_list,
                 )
                 context.task_id = int(fkv_task_id)
-                if unmatched_count > 0:
-                    with self._store_profile_scope(
-                        "flexkv.connector.store.filter_slot_mapping"
-                    ):
-                        filtered = kv_indices[unmatched_mask]
-                    with self._store_profile_scope(
-                        "flexkv.connector.store.slot_mapping_to_cpu"
-                    ):
-                        slot_mapping_cpu = self._to_cpu_int64(filtered)
-                        swa_slot_mapping = self._build_swa_slot_mapping(filtered)
-                    swa_slots = (
-                        0
-                        if swa_slot_mapping is None
-                        else int(swa_slot_mapping.numel())
-                    )
-                    if self._coordinated_restore:
-                        # Keep the lookup ID even if launch or its acknowledgement
-                        # fails. Reset must drain the reader before releasing slots.
-                        self._inflight_stores[rid] = fkv_task_id
-                        self._inflight_store_contexts[rid] = context
+                if disposition in (PutMatchDisposition.READS_GPU, PutMatchDisposition.HOST_ONLY):
+                    launch_attempted = False
+                    direction = "D2H" if reads_gpu else "Host"
                     try:
-                        with self._store_profile_scope(
-                            "flexkv.connector.store.kvmanager_launch"
-                        ):
+                        if reads_gpu:
+                            with self._store_profile_scope("flexkv.connector.store.filter_slot_mapping"):
+                                filtered = kv_indices[unmatched_mask]
+                            with self._store_profile_scope("flexkv.connector.store.slot_mapping_to_cpu"):
+                                slot_mapping_cpu = self._to_cpu_int64(filtered)
+                                swa_slot_mapping = self._build_swa_slot_mapping(
+                                    filtered if unmatched_count else kv_indices
+                                )
+                            if unmatched_count == 0 and swa_slot_mapping is None:
+                                raise RuntimeError("SWA-only PUT requires a GPU slot mapping")
+                        else:
+                            slot_mapping_cpu = np.empty(0, dtype=np.int64)
+                            swa_slot_mapping = None
+                        with self._store_profile_scope("flexkv.connector.store.kvmanager_launch"):
+                            # Keep the plan tracked if launch or its acknowledgement fails.
+                            self._inflight_stores[rid] = fkv_task_id
+                            self._inflight_store_contexts[rid] = context
+                            launch_attempted = True
                             self.kv_manager.launch(
                                 task_ids=[fkv_task_id],
                                 slot_mappings=[slot_mapping_cpu],
@@ -1912,35 +1939,32 @@ class FlexKVConnector:
                             )
                     except Exception as exc:  # noqa: BLE001
                         store_start["error"] = str(exc) or type(exc).__name__
+                        if not launch_attempted:
+                            try:
+                                self.kv_manager.cancel([fkv_task_id])
+                            except Exception:
+                                self._inflight_stores[rid] = fkv_task_id
+                                self._inflight_store_contexts[rid] = context
+                                logger.exception("FlexKV failed to cancel an unlaunched PUT")
+                            else:
+                                self._inflight_stores.pop(rid, None)
+                                self._inflight_store_contexts.pop(rid, None)
                         self._log_cache_op(
-                            context,
-                            "complete",
-                            "failed",
-                            direction="D2H",
-                            transfer_mode="no-layerwise",
-                            stage="launch",
-                            error=str(exc),
+                            context, "complete", "failed", direction=direction,
+                            transfer_mode="no-layerwise", stage="launch", error=str(exc),
                         )
                     else:
                         store_start["active"] = True
                         self._log_cache_op(
-                            context,
-                            "launch",
-                            "running",
-                            direction="D2H",
-                            transfer_mode="no-layerwise",
-                            tokens=unmatched_count,
-                            slots=int(slot_mapping_cpu.numel()),
-                            swa_slots=swa_slots,
+                            context, "launch", "running", direction=direction,
+                            transfer_mode="no-layerwise", tokens=unmatched_count,
+                            slots=len(slot_mapping_cpu),
+                            swa_slots=0 if swa_slot_mapping is None else int(swa_slot_mapping.numel()),
                         )
                 else:
                     self._log_cache_op(
-                        context,
-                        "complete",
-                        "skipped",
-                        direction="D2H",
-                        reason="already_cached",
-                        tokens=0,
+                        context, "complete", "skipped", direction="D2H",
+                        reason=disposition.value, tokens=0,
                     )
 
         try:
@@ -1960,9 +1984,10 @@ class FlexKVConnector:
                     f"[FlexKV] store launch failed: {store_start['error']}"
                 )
             if not store_start.get("active"):
-                return -1
+                return FlexKVStoreResult(already_cached=bool(store_start.get("already_cached")))
 
             fkv_task_id = int(store_start["task_id"])
+            reads_gpu = bool(store_start.get("reads_gpu", True))
             slot_count = int(store_start.get("slot_count", -1))
             mask_list = store_start.get("unmatched_mask", [])
             if fkv_task_id < 0 or slot_count != len(kv_indices):
@@ -1971,36 +1996,31 @@ class FlexKVConnector:
                     f"task_id={fkv_task_id}, slot_count={slot_count}, "
                     f"slot_len={len(kv_indices)}"
                 )
+            context.task_id = fkv_task_id
+            self._inflight_stores[rid] = fkv_task_id
+            self._inflight_store_contexts[rid] = context
+            # Cross-node PP needs the local stage's slots, or an empty
+            # rendezvous message when the graph never reads the GPU.
+            if self._sync_ctx.should_send_slot_mapping_to_remote:
+                if reads_gpu:
+                    if len(mask_list) != len(kv_indices):
+                        raise RuntimeError(
+                            "[FlexKV] invalid cross-node store mask: "
+                            f"mask_len={len(mask_list)}, slot_len={len(kv_indices)}"
+                        )
+                    unmatched_mask = torch.as_tensor(
+                        mask_list, dtype=torch.bool, device=kv_indices.device
+                    )
+                    slot_mapping_cpu = self._to_cpu_int64(kv_indices[unmatched_mask])
+                else:
+                    slot_mapping_cpu = torch.empty(0, dtype=torch.int64)
+                self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
         except Exception as exc:
-            # At this point the leader may have launched D2H. Only the leader
-            # can rule that out when the start notification is unavailable.
-            if self._coordinated_restore and (
-                not self._sync_ctx.is_sync_leader or rid in self._inflight_stores
-            ):
+            # Only the leader can rule out a launch after a failed notification.
+            if not self._sync_ctx.is_sync_leader or rid in self._inflight_stores:
                 raise StoreSubmissionUncertainError(str(exc)) from exc
             raise
-
-        # Cross-node PP needs the local PP stage's physical slot mapping.
-        if self._sync_ctx.should_send_slot_mapping_to_remote:
-            if len(mask_list) != len(kv_indices):
-                raise RuntimeError(
-                    "[FlexKV] invalid cross-node store mask: "
-                    f"mask_len={len(mask_list)}, slot_len={len(kv_indices)}"
-                )
-            unmatched_mask = torch.as_tensor(
-                mask_list, dtype=torch.bool, device=kv_indices.device
-            )
-            filtered = kv_indices[unmatched_mask]
-            self._send_slot_mapping_to_remote(
-                fkv_task_id, self._to_cpu_int64(filtered)
-            )
-
-        # This is deliberately done on every rank. SGLang uses the returned
-        # positive task id to keep radix-node locks (and GPU slots) alive.
-        context.task_id = fkv_task_id
-        self._inflight_stores[rid] = fkv_task_id
-        self._inflight_store_contexts[rid] = context
-        return fkv_task_id
+        return FlexKVStoreResult(task_id=fkv_task_id, reads_gpu=reads_gpu)
 
     def check_completed_stores(self) -> List[str]:
         """Return rids whose stores have completed since the last call."""

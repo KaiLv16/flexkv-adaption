@@ -34,7 +34,7 @@ from flexkv.cache.cache_engine import (
     CPUONLY_CACHE_STRATEGY,
 )
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
-from flexkv.common.request import KVResponseStatus, KVResponse
+from flexkv.common.request import KVResponseStatus, KVResponse, PutMatchDisposition, PutMatchResult
 from flexkv.cache.redis_meta import RedisMeta
 from flexkv.integration.dynamo.collector import KVEventCollector
 from flexkv.metrics.collector import get_global_collector
@@ -443,16 +443,19 @@ class KVTaskManager:
                         token_mask: Optional[np.ndarray] = None,
                         is_fake_slot_mapping: bool = False,
                         namespace: Optional[List[str]] = None,
-                        ) -> None:
+                        *, return_disposition: bool = False,
+                        ) -> Optional[PutMatchDisposition]:
         if task_id in self.tasks:
             raise ValueError(f"Task ID {task_id} already exists")
-        graph, return_mask, callback, op_callback_dict, task_end_op_id = self.cache_engine.put(
+        put_result = self.cache_engine.put(
             request_id=task_id,
             token_ids=token_ids,
             token_mask=token_mask,
             slot_mapping=slot_mapping,
             dp_client_id=dp_client_id,
-            namespace=namespace)
+            namespace=namespace,
+            **({"return_disposition": True} if return_disposition else {}))
+        graph, return_mask, callback, op_callback_dict, task_end_op_id = put_result[:5]
         self.tasks[task_id] = KVTask(
             task_id=task_id,
             task_type=TaskType.PUT,
@@ -468,6 +471,9 @@ class KVTaskManager:
             op_callback_dict=op_callback_dict)
         self.graph_to_task[graph.graph_id] = task_id
         self._log_task_created(self.tasks[task_id])
+        if return_disposition:
+            return put_result[5]
+        return None
 
     def create_prefetch_task(self,
                             task_id: int,
@@ -1576,16 +1582,16 @@ class KVTaskEngine(KVTaskManager):
                   dp_client_id: int = 0,
                   token_mask: Optional[np.ndarray] = None,
                   task_id: int = -1,
-                  namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                  namespace: Optional[List[str]] = None,
+                  *, return_disposition: bool = False) -> PutMatchResult:
         self._update_tasks(timeout=0)
         fake_slot_mapping = np.zeros_like(token_ids)
-        result_task_id, return_mask = self._put_match_impl(token_ids,
-                                                           fake_slot_mapping,
-                                                           is_fake_slot_mapping=True,
-                                                           token_mask=token_mask,
-                                                           dp_client_id=dp_client_id,
-                                                           task_id=task_id,
-                                                           namespace=namespace)
+        result = self._put_match_impl(
+            token_ids, fake_slot_mapping, is_fake_slot_mapping=True,
+            token_mask=token_mask, dp_client_id=dp_client_id, task_id=task_id,
+            namespace=namespace, return_disposition=return_disposition,
+        )
+        result_task_id, return_mask = result[:2]
         # trace put match request
         self.tracer.trace_request(
             request_type="PUT_MATCH",
@@ -1595,7 +1601,16 @@ class KVTaskEngine(KVTaskManager):
             token_mask=token_mask,
             dp_client_id=dp_client_id
         )
-        return result_task_id, return_mask
+        if return_disposition:
+            disposition = result[2]
+            if disposition in (PutMatchDisposition.ALREADY_CACHED, PutMatchDisposition.SKIPPED):
+                # Empty graphs have completed synchronously. The caller has
+                # no task to launch or wait on, so retire the response here.
+                if self.tasks[result_task_id].status != TaskStatus.COMPLETED:
+                    disposition = PutMatchDisposition.SKIPPED
+                self._release_task(result_task_id)
+                return -1, return_mask, disposition
+        return result
 
     def _put_match_impl(self,
                         token_ids: np.ndarray,
@@ -1604,21 +1619,23 @@ class KVTaskEngine(KVTaskManager):
                         is_fake_slot_mapping: bool = False,
                         token_mask: Optional[np.ndarray] = None,
                         task_id: int = -1,
-                        namespace: Optional[List[str]] = None) -> Tuple[int, np.ndarray]:
+                        namespace: Optional[List[str]] = None,
+                        *, return_disposition: bool = False) -> PutMatchResult:
         if token_mask is None:
             token_mask = np.ones_like(token_ids)
         if task_id == -1:
             task_id = self._gen_task_id()
         nvtx.push_range(f"put match: task_id={task_id}", color=get_nvtx_default_color())
-        self.create_put_task(task_id=task_id,
-                             token_ids=token_ids,
-                             slot_mapping=slot_mapping,
-                             dp_client_id=dp_client_id,
-                             token_mask=token_mask,
-                             is_fake_slot_mapping=is_fake_slot_mapping,
-                             namespace=namespace)
+        disposition = self.create_put_task(
+            task_id=task_id, token_ids=token_ids, slot_mapping=slot_mapping,
+            dp_client_id=dp_client_id, token_mask=token_mask,
+            is_fake_slot_mapping=is_fake_slot_mapping, namespace=namespace,
+            return_disposition=return_disposition,
+        )
         self._process_empty_graph(task_id)
         nvtx.pop_range()
+        if return_disposition:
+            return task_id, self.tasks[task_id].return_mask, disposition
         return task_id, self.tasks[task_id].return_mask
 
     @on_runtime

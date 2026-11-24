@@ -18,7 +18,7 @@ import threading
 import time
 from functools import partial, wraps
 from queue import Queue
-from typing import List, Tuple, Optional, Dict, Callable
+from typing import List, Tuple, Optional, Dict, Callable, Union
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -33,6 +33,7 @@ from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.swa_cache_engine import SWAOpConstructor, SWAPutChainOpIds
 from flexkv.common.block import SequenceMeta, format_block_hash
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV, SWAPoolConfig, is_multi_group
+from flexkv.common.request import PutMatchDisposition
 from flexkv.common.transfer import (
     CompletedOp,
     CompletionAwareCallback,
@@ -264,9 +265,10 @@ class PutTransferPlan:
     tier_commits: List[DeferredTierCommit] = field(default_factory=list)
     # Resources an early tier commit gave up but the graph still reads.
     deferred_release: Optional[DeferredRelease] = None
+    already_cached: bool = False
 
     @classmethod
-    def empty(cls) -> "PutTransferPlan":
+    def empty(cls, *, already_cached: bool = False) -> "PutTransferPlan":
         return cls(
             transfer_graph=TransferOpGraph.create_empty_graph(),
             finished_ops_ids=[],
@@ -275,6 +277,7 @@ class PutTransferPlan:
             buffer_to_free={},
             num_gpu_blocks_to_transfer=0,
             skipped_gpu_blocks=0,
+            already_cached=already_cached,
         )
 
 
@@ -2173,8 +2176,11 @@ class GlobalCacheEngine:
             slot_mapping: np.ndarray,
             dp_client_id: int,
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
-            namespace: Optional[List[str]] = None) \
-                -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
+            namespace: Optional[List[str]] = None,
+            *, return_disposition: bool = False) -> Union[
+                Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int],
+                Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int, PutMatchDisposition],
+            ]:
         req = self._prepare_request(token_ids, token_mask, slot_mapping, namespace)
         block_start_idx, block_end_idx = req.block_start_idx, req.block_end_idx
         # the mask should has a prefix of True
@@ -2238,6 +2244,17 @@ class GlobalCacheEngine:
         if self._metrics_collector is not None:
             self._update_mempool_metrics()
 
+        if return_disposition:
+            if transfer_graph.num_ops:
+                # This includes SWA-only D2H, whose GPU slots are absent from
+                # the Full KV return mask.
+                reads_gpu = bool(transfer_graph._gpu_transfer_op_id)
+                disposition = (PutMatchDisposition.READS_GPU if reads_gpu
+                               else PutMatchDisposition.HOST_ONLY)
+            else:
+                disposition = (PutMatchDisposition.ALREADY_CACHED if plan.already_cached
+                               else PutMatchDisposition.SKIPPED)
+            return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id, disposition
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
     def _put_impl_with_remote(self,
@@ -2300,8 +2317,6 @@ class GlobalCacheEngine:
 
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
-        if fragment12_num_blocks == 0 and not self.use_mooncake_store_backend:
-            return self._empty_put_return(request_id)
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
             fragment2_num_blocks = 0
@@ -2316,10 +2331,13 @@ class GlobalCacheEngine:
             remote_put_hit_blocks = len(remote_matched_blocks)
             fragment3_num_blocks = len(gpu_block_ids) - len(remote_matched_blocks)
 
-        if (fragment12_num_blocks == 0
-                and fragment2_num_blocks == 0
-                and fragment3_num_blocks == 0):
-            return self._empty_put_return(request_id)
+        if fragment12_num_blocks == 0:
+            all_tiers_ready = fragment2_num_blocks == 0 and fragment3_num_blocks == 0
+            if all_tiers_ready or not self.use_mooncake_store_backend:
+                return PutTransferPlan.empty(
+                    already_cached=all_tiers_ready and len(gpu_block_ids) > 0
+                    and not self.swa_op_constructor.enabled
+                )
 
         fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
 
@@ -2657,7 +2675,11 @@ class GlobalCacheEngine:
         num_skipped_blocks = len(cpu_matched_blocks)
         fragment12_num_blocks = len(gpu_block_ids) - num_skipped_blocks
         if fragment12_num_blocks == 0:
-            return self._empty_put_return(request_id)
+            return PutTransferPlan.empty(
+                already_cached=len(gpu_block_ids) > 0
+                and (not enable_ssd or len(ssd_matched_blocks) == len(gpu_block_ids))
+                and not self.swa_op_constructor.enabled
+            )
         fragment2_num_blocks = len(gpu_block_ids) - len(ssd_matched_blocks)
         if not enable_ssd:
             fragment2_num_blocks = 0

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from flexkv.common.request import KVResponse, KVResponseStatus
+from flexkv.common.request import KVResponse, KVResponseStatus, PutMatchDisposition
 from flexkv.integration.sglang.comm import FlexKVScatterChannel
 from flexkv.integration.sglang.connector import FlexKVConnector, StoreSubmissionUncertainError
 
@@ -72,6 +72,8 @@ def test_store_start_tracks_task_on_nonleader_rank():
             "rid": "request",
             "task_id": -1,
             "active": False,
+            "already_cached": False,
+            "reads_gpu": False,
             "slot_count": 4,
             "unmatched_count": 0,
             "unmatched_mask": [],
@@ -90,6 +92,7 @@ def test_store_leader_accepts_pinned_sideband_cpu_mapping():
     connector.kv_manager.put_match.return_value = (
         17,
         np.asarray([True, False, True, False], dtype=np.bool_),
+        PutMatchDisposition.READS_GPU,
     )
     connector._sync_ctx = SimpleNamespace(
         is_sync_leader=True,
@@ -107,6 +110,60 @@ def test_store_leader_accepts_pinned_sideband_cpu_mapping():
     launch = connector.kv_manager.launch.call_args.kwargs
     assert launch["slot_mappings"][0].tolist() == [4, 8]
     assert launch["swa_slot_mappings"] == [None]
+
+
+def test_swa_only_gpu_store_binds_the_tail_even_with_an_empty_full_mask():
+    connector = _follower_connector(None)
+    connector._sync_ctx.is_sync_leader = True
+    connector._sync_ctx.scatter.side_effect = lambda value, **_: value
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.put_match.return_value = (
+        17, np.zeros(4, dtype=np.bool_), PutMatchDisposition.READS_GPU
+    )
+    connector._build_swa_slot_mapping = MagicMock(return_value=torch.arange(1, 5))
+    gpu_slots = torch.arange(4)
+
+    result = connector.store_kv_with_result("request", range(4), gpu_slots)
+    assert result.task_id == 17 and result.reads_gpu
+    assert connector._build_swa_slot_mapping.call_args.args[0] is gpu_slots
+    launch = connector.kv_manager.launch.call_args.kwargs
+    assert launch["slot_mappings"][0].numel() == 0
+    assert launch["swa_slot_mappings"][0].tolist() == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("disposition, task_id", [
+    (PutMatchDisposition.ALREADY_CACHED, -1),
+    (PutMatchDisposition.SKIPPED, -1),
+    (PutMatchDisposition.HOST_ONLY, 17),
+])
+def test_zero_d2h_store_result_is_consistent_across_ranks(disposition, task_id):
+    leader = _follower_connector(None)
+    leader._sync_ctx.is_sync_leader = True
+    leader._sync_ctx.scatter.side_effect = lambda value, **_: value
+    leader.kv_manager = MagicMock()
+    leader.kv_manager.put_match.return_value = (
+        task_id, np.zeros(4, dtype=np.bool_), disposition
+    )
+    gpu_slots = torch.arange(4)
+
+    result = leader.store_kv_with_result("request", range(4), gpu_slots)
+    payload = leader._sync_ctx.scatter.call_args.args[0]
+    follower = _follower_connector(payload)
+    follower._sync_ctx.should_send_slot_mapping_to_remote = True
+    follower._send_slot_mapping_to_remote = MagicMock()
+    assert follower.store_kv_with_result("request", range(4), gpu_slots) == result
+
+    assert result.task_id == task_id
+    assert result.already_cached == (disposition == PutMatchDisposition.ALREADY_CACHED)
+    assert not result.reads_gpu
+    if task_id >= 0:
+        assert leader.kv_manager.launch.call_args.kwargs["slot_mappings"][0].size == 0
+        assert leader._inflight_stores == follower._inflight_stores == {"request": task_id}
+        assert follower._send_slot_mapping_to_remote.call_args.args[1].numel() == 0
+    else:
+        leader.kv_manager.launch.assert_not_called()
+        follower._send_slot_mapping_to_remote.assert_not_called()
+        assert not leader._inflight_stores and not follower._inflight_stores
 
 
 def test_lookup_accepts_sglang_array_token_ids():
@@ -378,7 +435,9 @@ def test_namespace_is_forwarded_to_lookup_store_and_prefetch():
     connector._prefetch_planned_tokens = {}
     connector.kv_manager = MagicMock()
     connector.kv_manager.get_match.return_value = (-1, np.zeros(4, dtype=bool))
-    connector.kv_manager.put_match.return_value = (-1, np.zeros(4, dtype=bool))
+    connector.kv_manager.put_match.return_value = (
+        -1, np.zeros(4, dtype=bool), PutMatchDisposition.SKIPPED
+    )
     connector.kv_manager.prefetch_async.return_value = (23, 4)
     namespace = ['["sglang-cache-v1","adapter","salt"]']
     connector.lookup_kv([1, 2, 3, 4], torch.ones(4, dtype=torch.bool), rid="r", namespace=namespace)
@@ -406,7 +465,9 @@ def test_coordinated_store_marks_uncertainty_after_launch_attempt():
     connector._new_op_context = MagicMock(return_value=SimpleNamespace(task_id=-1))
     connector._log_cache_op = MagicMock()
     connector.kv_manager = MagicMock()
-    connector.kv_manager.put_match.return_value = (17, np.ones(4, dtype=np.bool_))
+    connector.kv_manager.put_match.return_value = (
+        17, np.ones(4, dtype=np.bool_), PutMatchDisposition.READS_GPU
+    )
     connector.kv_manager.launch.side_effect = OSError()
 
     with pytest.raises(StoreSubmissionUncertainError, match="OSError"):
@@ -517,7 +578,9 @@ def test_cp_store_marks_uncertainty_after_launch_attempt():
     connector._sync_ctx.scatter.side_effect = lambda value, **_: value
     connector._swa_kv_pool = None
     connector.kv_manager = MagicMock()
-    connector.kv_manager.put_match.return_value = (17, np.ones(4, dtype=np.bool_))
+    connector.kv_manager.put_match.return_value = (
+        17, np.ones(4, dtype=np.bool_), PutMatchDisposition.READS_GPU
+    )
     connector.kv_manager.launch.side_effect = OSError()
 
     with pytest.raises(StoreSubmissionUncertainError, match="OSError"):
@@ -532,7 +595,9 @@ def test_draft_store_marks_uncertainty_after_launch_attempt():
     connector._sync_ctx.scatter.side_effect = lambda value, **_: value
     connector._swa_kv_pool = None
     connector.kv_manager = MagicMock()
-    connector.kv_manager.put_match.return_value = (17, np.ones(4, dtype=np.bool_))
+    connector.kv_manager.put_match.return_value = (
+        17, np.ones(4, dtype=np.bool_), PutMatchDisposition.READS_GPU
+    )
     connector.kv_manager.launch.side_effect = OSError()
 
     with pytest.raises(StoreSubmissionUncertainError, match="OSError"):

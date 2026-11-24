@@ -6,7 +6,7 @@ import numpy as np
 from flexkv.common.config import ModelConfig, LayerGroupSpec
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
-from flexkv.common.request import KVResponseStatus
+from flexkv.common.request import KVResponseStatus, PutMatchDisposition
 
 
 RegistrationKey = Tuple[int, int]
@@ -105,6 +105,7 @@ class PutMatchRequest:
     token_mask: Optional[np.ndarray]
     task_id: int = -1
     namespace: Optional[List[str]] = None
+    return_disposition: bool = False
 
 
 @dataclass
@@ -162,6 +163,7 @@ class Response:
     status: Optional[Dict[int, KVResponseStatus]] = None
     is_ready: bool = False
     error_msg: Optional[str] = None
+    put_disposition: Optional[PutMatchDisposition] = None
 
     @property
     def success(self) -> bool:

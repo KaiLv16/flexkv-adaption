@@ -25,7 +25,8 @@ from flexkv.common.config import (
     GLOBAL_CONFIG_FROM_ENV,
     ModelConfig,
 )
-from flexkv.common.transfer import DeviceType
+from flexkv.common.request import PutMatchDisposition
+from flexkv.common.transfer import DeviceType, TransferType
 
 pytestmark = pytest.mark.unit
 
@@ -173,3 +174,35 @@ def test_aborted_put_releases_the_remote_pin_and_its_staging(engine):
         "unwritten remote staging must go back to the pool"
     assert remote.match(_seq(full)).num_matched_blocks == 2
     assert remote.index.total_cached_blocks() == 2
+
+
+@pytest.mark.parametrize("state, expected", [
+    ("hot", PutMatchDisposition.ALREADY_CACHED),
+    ("pool_full", PutMatchDisposition.SKIPPED),
+    ("remote_miss", PutMatchDisposition.HOST_ONLY),
+])
+def test_mooncake_put_plan_distinguishes_zero_d2h_outcomes(engine, monkeypatch, state, expected):
+    cpu, remote = engine.cpu_cache_engine, engine.remote_cache_engine
+    tokens = _tokens(2, seed=10)
+    engine.use_mooncake_store_backend = True
+    if state != "pool_full":
+        anchor = cpu.insert(_seq(tokens), cpu.take(2))
+        pins_before = _locks(anchor)
+    else:
+        monkeypatch.setattr(cpu, "take", lambda **_: np.empty(0, dtype=np.int64))
+    if state == "hot":
+        remote.insert(_seq(tokens), remote.take(2))
+
+    graph, mask, callback, _, _, disposition = engine.put(
+        request_id=1, token_ids=tokens, token_mask=np.ones_like(tokens, dtype=bool),
+        slot_mapping=np.arange(tokens.size, dtype=np.int64), dp_client_id=0,
+        return_disposition=True,
+    )
+    assert disposition == expected and not mask.any()
+    if state == "remote_miss":
+        assert any(op.transfer_type == TransferType.H2REMOTE for op in graph._op_map.values())
+        assert _locks(anchor) == pins_before + 1
+        callback.abort()
+        assert _locks(anchor) == pins_before
+    else:
+        assert graph.num_ops == 0

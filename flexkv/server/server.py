@@ -453,15 +453,19 @@ class KVServer:
 
     def _handle_put_match_request(self, req: PutMatchRequest) -> None:
         """Handle PutMatch request"""
-        req_id, mask = self.kv_task_engine.put_match(
+        return_disposition = getattr(req, "return_disposition", False)
+        result = self.kv_task_engine.put_match(
             token_ids=req.token_ids,
             token_mask=req.token_mask,
             dp_client_id=req.dp_client_id,
             task_id=req.task_id,
             namespace=req.namespace,
+            return_disposition=return_disposition,
         )
+        req_id, mask = result[:2]
         response = Response(dp_client_id=req.dp_client_id,
-                            task_id=req_id, mask=mask)
+                            task_id=req_id, mask=mask,
+                            put_disposition=result[2] if return_disposition else None)
         result_zmq = self.client_manager.get_zmq(req.dp_client_id)
         result_zmq.send_pyobj(response)
 
