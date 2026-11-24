@@ -5,15 +5,18 @@ This edge has no native engine: every byte moves through a ``StorageBackend``
 geometry those backends read in ``attach``.
 """
 
+import os
+import time
 from multiprocessing.connection import Connection
 from typing import List, Union
 
 import torch
 from torch.multiprocessing import Queue as MPQueue
 
+from flexkv.common.debug import flexkv_logger
 from flexkv.common.storage import KVCacheLayout
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
-from flexkv.transfer.backends import StorageBackend
+from flexkv.transfer.backends import MooncakeStoreBackend, StorageBackend
 from flexkv.transfer.geometry import ChunkStrides, EdgeGeometry, HostSide
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerTransferResult
 from flexkv.transfer.workers.runtime import TransferWorkerBase
@@ -76,6 +79,30 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         )
 
         self._attach_backend(backend, self._build_geometry(cpu_kv_layout, dtype))
+        if isinstance(backend, MooncakeStoreBackend) and os.getenv("FLEXKV_BATCH_L3_CONTROL") == "1":
+            self._launch_transfer_batch = self._launch_mooncake_batch
+
+    def _launch_mooncake_batch(self, ops):
+        """Coalesce ops already on the pipe, leaving graph ownership separate."""
+        if len(ops) < 2 or any(isinstance(op, dict) for op in ops):
+            return {}
+        if any(op.transfer_type != ops[0].transfer_type for op in ops):
+            return {}
+        start = time.time()
+        results = self._backend.try_transfer_batch(self, ops)
+        end = time.time()
+        completions = {}
+        for op, flags in zip(ops, results):
+            try:
+                self._log_transfer_performance(
+                    op, sum(flags) * self._backend.bytes_per_block, start, end
+                )
+            except Exception:
+                flexkv_logger.exception("Failed to log Mooncake batch member %s", op.transfer_op_id)
+            completions[op.transfer_op_id] = WorkerTransferResult(
+                transfer_op_id=op.transfer_op_id, block_results=flags
+            )
+        return completions
 
     def _build_geometry(
         self, cpu_kv_layout: KVCacheLayout, dtype: torch.dtype

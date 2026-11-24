@@ -2120,18 +2120,97 @@ class FlexKVConnector:
     # Public API — prefetch
     # ------------------------------------------------------------------
 
+    def _exchange_prefetch_batch(self, rids, channel, run):
+        """Collect per-request payloads on the owner and fan them out once."""
+        sync = self._sync_ctx
+        if sync.is_sync_leader:
+            payloads = {}
+
+            def collect(rid, payload):
+                payloads[rid] = payload
+                return payload
+
+            result, error = [], None
+            try:
+                result = run(collect)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            if sync.needs_sync:
+                sync.scatter((rids, payloads, error), channel=channel)
+            if error is not None:
+                raise RuntimeError(error)
+            return result
+
+        leader_rids, payloads, error = sync.scatter(None, channel=channel)
+        if error is not None:
+            raise RuntimeError(error)
+        if leader_rids != rids:
+            raise RuntimeError("FlexKV prefetch batch differs across ranks")
+        return run(lambda rid, payload: payloads[rid])
+
+    def prefetch_batch_async(self, items):
+        """Submit the current intake batch without delaying individual arrivals."""
+        if len(items) < 2:
+            return [
+                self.prefetch_async(rid, tokens, sglang_req_id=req_id, namespace=namespace)
+                for rid, tokens, req_id, namespace in items
+            ]
+
+        def launch(exchange):
+            return [
+                self.prefetch_async(
+                    rid, tokens, sglang_req_id=req_id, namespace=namespace,
+                    _exchange=lambda payload: exchange(rid, payload),
+                )
+                for rid, tokens, req_id, namespace in items
+            ]
+
+        return self._exchange_prefetch_batch(
+            [item[0] for item in items], FlexKVScatterChannel.PREFETCH_START, launch
+        )
+
+    def poll_prefetch_batch(self, rids):
+        """Poll all outstanding prefetches in one backend call and one scatter."""
+        if len(rids) < 2:
+            return [self.check_prefetch_progress(rid) for rid in rids]
+
+        def poll(exchange):
+            results = {}
+            if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+                if self._chunked_prefetch:
+                    handles = [self._prefetch_sessions[rid] for rid in rids]
+                    results = self.kv_manager.progress_prefetch(handles, demand_handles=handles)
+                else:
+                    ids = [self._ongoing_prefetches[rid] for rid in rids]
+                    try:
+                        results = self.kv_manager.try_wait(task_ids=ids) or {}
+                    except Exception:
+                        logger.exception("FlexKV prefetch batch poll failed")
+            return [
+                self.check_prefetch_progress(
+                    rid, _results=results, _exchange=lambda payload: exchange(rid, payload)
+                )
+                for rid in rids
+            ]
+
+        return self._exchange_prefetch_batch(rids, FlexKVScatterChannel.PREFETCH_PROGRESS, poll)
+
     def prefetch_async(
         self,
         rid: str,
         token_ids: Sequence[int],
         sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
         namespace: Optional[List[str]] = None,
-        *, candidate_start_token: int = 0,
+        *, candidate_start_token: int = 0, _exchange=None,
     ) -> int:
         if not self._prefetch_enabled or not rid:
             return -1
         namespace = self._cache_namespace(namespace)
         if getattr(self, "_chunked_prefetch", False):
+            if _exchange is not None:
+                return self._start_chunked_prefetch(
+                    rid, token_ids, candidate_start_token, namespace, _exchange=_exchange
+                )
             return self._start_chunked_prefetch(rid, token_ids, candidate_start_token, namespace)
         context = self._new_op_context("prefetch", rid, sglang_req_id)
         task_id = -1
@@ -2160,7 +2239,10 @@ class FlexKVConnector:
             except Exception as exc:  # noqa: BLE001
                 prefetch_error = exc
                 task_id = -1
-        if self._sync_ctx.needs_sync:
+        if _exchange is not None:
+            payload = _exchange({"task_id": task_id, "planned_tokens": planned_tokens})
+            task_id, planned_tokens = payload["task_id"], int(payload["planned_tokens"])
+        elif self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
                 {"task_id": task_id, "planned_tokens": planned_tokens},
                 channel=FlexKVScatterChannel.PREFETCH_START,
@@ -2188,8 +2270,10 @@ class FlexKVConnector:
             )
         return task_id
 
-    def check_prefetch_progress(self, rid: str) -> bool:
+    def check_prefetch_progress(self, rid: str, *, _exchange=None, _results=None) -> bool:
         if getattr(self, "_chunked_prefetch", False):
+            if _exchange is not None:
+                return self._check_chunked_prefetch(rid, _exchange=_exchange, _results=_results)
             return self._check_chunked_prefetch(rid)
         if not self._prefetch_enabled:
             return True
@@ -2201,7 +2285,10 @@ class FlexKVConnector:
         loaded_tokens = 0
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
-                completed = self.kv_manager.try_wait(task_ids=[task_id]) or {}
+                if _results is None:
+                    completed = self.kv_manager.try_wait(task_ids=[task_id]) or {}
+                else:
+                    completed = _results
             except Exception as exc:  # noqa: BLE001
                 context = getattr(self, "_prefetch_contexts", {}).get(rid)
                 context = context or self._new_op_context(
@@ -2235,7 +2322,10 @@ class FlexKVConnector:
                         )
                     else:
                         loaded_tokens = int(np.count_nonzero(return_mask))
-        if self._sync_ctx.needs_sync:
+        if _exchange is not None:
+            payload = _exchange({"done": done, "status": status, "loaded_tokens": loaded_tokens})
+            done, status, loaded_tokens = payload["done"], payload["status"], payload["loaded_tokens"]
+        elif self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
                 {
                     "done": done,
@@ -2259,7 +2349,9 @@ class FlexKVConnector:
             )
         return done
 
-    def _start_chunked_prefetch(self, rid, token_ids, candidate_start_token=0, namespace=None):
+    def _start_chunked_prefetch(
+        self, rid, token_ids, candidate_start_token=0, namespace=None, *, _exchange=None
+    ):
         if rid in self._prefetch_sessions:
             return self._prefetch_sessions[rid].session_id
         self._release_prefetch_result(rid)
@@ -2277,7 +2369,9 @@ class FlexKVConnector:
                 )
             except Exception as exc:
                 payload["error"] = str(exc)
-        if self._sync_ctx.needs_sync:
+        if _exchange is not None:
+            payload = _exchange(payload)
+        elif self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
                 payload, channel=FlexKVScatterChannel.PREFETCH_START
             )
@@ -2288,19 +2382,24 @@ class FlexKVConnector:
         self._prefetch_sessions[rid] = handle
         return handle.session_id
 
-    def _check_chunked_prefetch(self, rid):
+    def _check_chunked_prefetch(self, rid, *, _exchange=None, _results=None):
         handle = self._prefetch_sessions.get(rid)
         if handle is None:
             return True
         payload = {"snapshot": None, "error": None}
         if self._sync_ctx.is_sync_leader:
             try:
-                payload["snapshot"] = self.kv_manager.progress_prefetch(
-                    [handle], demand_handles=[handle]
-                )[handle]
+                if _results is None:
+                    payload["snapshot"] = self.kv_manager.progress_prefetch(
+                        [handle], demand_handles=[handle]
+                    )[handle]
+                else:
+                    payload["snapshot"] = _results[handle]
             except Exception as exc:
                 payload["error"] = str(exc)
-        if self._sync_ctx.needs_sync:
+        if _exchange is not None:
+            payload = _exchange(payload)
+        elif self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
                 payload, channel=FlexKVScatterChannel.PREFETCH_PROGRESS
             )
