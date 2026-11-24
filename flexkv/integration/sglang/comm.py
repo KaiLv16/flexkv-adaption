@@ -47,6 +47,7 @@ class FlexKVScatterChannel(str, Enum):
     """Logical channels multiplexed over the hierarchical P2P fan-out."""
 
     LOOKUP = "lookup"
+    LOOKUP_BATCH = "lookup_batch"
     LAYERWISE_MANIFEST = "layerwise_manifest"
     LAYERWISE_BATCH = "layerwise_batch"
     STORE_COMPLETION = "store_completion"
@@ -69,6 +70,7 @@ _SCATTER_CHANNEL_OFFSETS = {
     FlexKVScatterChannel.STORE_RESET: 8,
     FlexKVScatterChannel.STORE_READY: 9,
     FlexKVScatterChannel.LAYERWISE_BATCH: 10,
+    FlexKVScatterChannel.LOOKUP_BATCH: 11,
 }
 _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.LOOKUP: dict,
@@ -81,6 +83,7 @@ _SCATTER_CHANNEL_TYPES = {
     FlexKVScatterChannel.STORE_RESET: dict,
     FlexKVScatterChannel.STORE_READY: list,
     FlexKVScatterChannel.LAYERWISE_BATCH: dict,
+    FlexKVScatterChannel.LOOKUP_BATCH: list,
 }
 
 

@@ -37,7 +37,7 @@ import struct
 import time
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -869,6 +869,80 @@ class FlexKVConnector:
             self._release_prefetch_result(rid)
         return fkv_task_id, hit_length
 
+    def lookup_kv_batch(
+        self,
+        queries: Sequence[
+            Tuple[str, Callable[[], Sequence[int]], int, int, str, List[str]]
+        ],
+    ) -> List[Tuple[int, int]]:
+        """Share ordered lookup results in one scatter without allocating GPU slots.
+
+        Each query contains its tracking key, a lazy token provider, the GPU
+        prefix length, the token count, the SGLang request ID, and the namespace.
+        The scheduler agrees on this order before all ranks enter the scatter.
+        """
+        if not queries:
+            return []
+        keys = [query[0] for query in queries]
+        results = []
+        if self._sync_ctx.is_sync_leader:
+            for rid, token_ids, prefix_skip, token_count, _, namespace in queries:
+                task_id, hit = -1, 0
+                error = None
+                try:
+                    ids = np.asarray(token_ids(), dtype=np.int64)
+                    if ids.size != token_count or not 0 <= prefix_skip <= token_count:
+                        raise ValueError("Invalid FlexKV batch lookup token count or prefix")
+                    mask = np.zeros(token_count, dtype=bool)
+                    mask[prefix_skip:] = True
+                    task_id, matched = self.kv_manager.get_match(
+                        token_ids=ids,
+                        token_mask=mask,
+                        cpu_only=getattr(self, "_chunked_prefetch", False),
+                        swa_aware=self._swa_kv_pool is not None,
+                        namespace=self._cache_namespace(namespace),
+                    )
+                    raw_hit = int(matched.sum()) if matched is not None else 0
+                    hit = raw_hit // self.page_size * self.page_size
+                    if task_id >= 0 and raw_hit > 0 and hit == 0:
+                        self.kv_manager.cancel([task_id])
+                    if task_id < 0:
+                        hit = 0
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+                results.append((rid, task_id, hit, error))
+
+        if self._sync_ctx.needs_sync:
+            try:
+                results = self._sync_ctx.scatter(
+                    results, channel=FlexKVScatterChannel.LOOKUP_BATCH
+                )
+            except Exception:
+                if self._sync_ctx.is_sync_leader:
+                    task_ids = [tid for _, tid, hit, _ in results if hit > 0]
+                    if task_ids:
+                        self.kv_manager.cancel(task_ids)
+                raise
+        if [entry[0] for entry in results] != keys:
+            raise RuntimeError("FlexKV batch lookup order differs across ranks")
+
+        hits = []
+        for (_, task_id, hit, error), (rid, _, _, count, req_id, _) in zip(results, queries):
+            context = self._new_op_context("lookup", rid, req_id, task_id=task_id)
+            self._log_cache_op(
+                context, "complete", "failed" if error else "hit" if hit else "miss",
+                tokens=count, hit_tokens=hit, hit_blocks=hit // self.page_size,
+                error=error,
+            )
+            if hit > 0:
+                if self._pending_lookups.get(rid, task_id) != task_id:
+                    self.release_pending(rid)
+                self._pending_lookups[rid] = task_id
+                self._pending_lookup_contexts[rid] = context
+            self._release_prefetch_result(rid)
+            hits.append((task_id, hit))
+        return hits
+
     def sync_load_ready(self, local_ready: bool) -> bool:
         """Agree on allocation before any rank prepares a restore collective."""
         if self._sync_ctx.needs_sync:
@@ -1349,6 +1423,157 @@ class FlexKVConnector:
                 raise RuntimeError("Layerwise launch failed on a peer")
             self._layerwise_batch_launch_error = None
         return n, producer_id
+
+    def prepare_layerwise_loads(
+        self, items: Sequence[Tuple[str, torch.Tensor]]
+    ) -> None:
+        """Vote once on all restore destinations before flush submits the batch."""
+        assert self.enable_layerwise and self.layer_done_counter is not None, (
+            "Layerwise transfer is disabled. Set FLEXKV_ENABLE_LAYERWISE_TRANSFER=1."
+        )
+        sync = self._sync_ctx
+        counter = self.layer_done_counter
+        prepared = getattr(self, "_prepared_layerwise_loads", {})
+        rids = [rid for rid, _ in items]
+        generation = getattr(self, "_layerwise_generation", 0)
+        producer_id = -1
+        selected_new_counter = False
+        expected_count = 0
+        members = []
+        entries = []
+        registered = []
+        local_error = None
+        try:
+            if getattr(self, "_layerwise_batch_launch_error", None):
+                raise RuntimeError("Previous layerwise batch has unknown launch status")
+            if len(set(rids)) != len(rids) or any(rid in prepared for rid in rids):
+                raise RuntimeError("Duplicate prepared layerwise load")
+            for rid, slots in items:
+                task_id = self._pending_lookups.get(rid, -1)
+                if task_id < 0:
+                    raise RuntimeError(f"No pending FlexKV lookup for rid={rid}")
+                start_ns = time.perf_counter_ns()
+                slots_cpu = self._to_cpu_int64(slots)
+                swa_slots = self._build_swa_slot_mapping(slots)
+                context = self._pop_context(
+                    "_pending_lookup_contexts", rid, "load", task_id
+                )
+                members.append((rid, _PreparedLayerwiseLoad(
+                    task_id, -1, slots_cpu, swa_slots, context, start_ns,
+                )))
+                entries.append((
+                    rid, task_id, int(slots_cpu.numel()),
+                    self._slot_signature(slots_cpu) if self._cache_layer_split else None,
+                ))
+            if len({member.task_id for _, member in members}) != len(members):
+                raise RuntimeError("Duplicate FlexKV task in layerwise restore")
+            if members and sync.is_sync_leader:
+                producer_id = counter.update_producer()
+                selected_new_counter = counter.consumer_index != producer_id
+                expected_count = counter.expected_transfer_count(
+                    producer_id, allow_unclaimed_active=selected_new_counter
+                )
+        except Exception as exc:  # noqa: BLE001
+            local_error = str(exc)
+
+        manifest = {
+            "cmd": CMD_LAYERWISE,
+            "entries": entries,
+            "producer_id": producer_id,
+            "generation": generation,
+            "expected_signal_count": expected_count,
+            "error": local_error,
+        }
+        if sync.needs_sync:
+            manifest = sync.scatter(
+                manifest, channel=FlexKVScatterChannel.LAYERWISE_MANIFEST
+            )
+
+        try:
+            if local_error or manifest.get("error"):
+                raise RuntimeError(local_error or manifest["error"])
+            if (
+                manifest.get("cmd") != CMD_LAYERWISE
+                or manifest["generation"] != generation
+                or manifest["entries"] != entries
+            ):
+                raise RuntimeError("FlexKV layerwise manifest differs across ranks")
+            producer_id = manifest["producer_id"]
+            expected_count = manifest["expected_signal_count"]
+            if members and not sync.is_sync_leader and (
+                counter.expected_transfer_count(producer_id) != expected_count
+            ):
+                raise RuntimeError("FlexKV layerwise batch boundary differs across ranks")
+            for offset, (_, member) in enumerate(members):
+                member.producer_id = producer_id
+                if sync.should_send_slot_mapping_to_remote:
+                    self._send_slot_mapping_to_remote(
+                        member.task_id, member.slot_mapping
+                    )
+                if sync.is_sync_leader:
+                    counter.register_task(member.task_id, producer_id)
+                else:
+                    counter.register_task_with_explicit_counter_id(
+                        member.task_id, producer_id
+                    )
+                registered.append((member.task_id, False))
+                counter.set_consumer(member.task_id)
+                registered[len(registered) - 1] = (member.task_id, True)
+                if counter.events[producer_id].pending_transfers() != expected_count + offset:
+                    raise RuntimeError("FlexKV layerwise signal-count changed during registration")
+        except Exception as exc:  # noqa: BLE001
+            local_error = str(exc)
+
+        self._layerwise_generation = generation + 1
+        ready = int(local_error is None)
+        if sync.needs_sync:
+            ready = sync.all_reduce_min(ready)
+        if not ready:
+            cleanup_error = None
+            try:
+                for task_id, transfer_added in reversed(registered):
+                    counter.rollback_prepared_transfer(
+                        task_id, producer_id, transfer_added=transfer_added
+                    )
+                if not registered and sync.is_sync_leader and selected_new_counter:
+                    counter.abort_unregistered_selection(producer_id)
+            except Exception as exc:  # noqa: BLE001
+                cleanup_error = str(exc)
+            for rid in dict.fromkeys(rids):
+                if rid in prepared:
+                    continue
+                try:
+                    self.release_pending(rid)
+                except Exception as exc:  # noqa: BLE001
+                    cleanup_error = str(exc)
+            cleanup_ok = int(cleanup_error is None)
+            if sync.needs_sync:
+                cleanup_ok = sync.all_reduce_min(cleanup_ok)
+            if not cleanup_ok:
+                raise RuntimeError(
+                    "FlexKV layerwise preflight rollback failed: "
+                    f"{cleanup_error or 'remote rank failure'}"
+                )
+            for _, member in members:
+                self._log_cache_op(
+                    member.context, "complete", "failed", start_ns=member.start_ns,
+                    direction="H2D", transfer_mode="layerwise", stage="preflight",
+                    rank=sync.world_rank, generation=generation,
+                    producer_id=producer_id,
+                    error=local_error or "another rank rejected the pre-launch state",
+                )
+            raise RuntimeError("FlexKV deferred layerwise restore preparation rejected")
+
+        for offset, (rid, member) in enumerate(members):
+            del self._pending_lookups[rid]
+            self._log_cache_op(
+                member.context, "register", "ready", direction="H2D",
+                transfer_mode="layerwise", rank=sync.world_rank,
+                generation=generation, producer_id=producer_id,
+                expected_signal_count=expected_count + offset,
+            )
+        prepared.update(members)
+        self._prepared_layerwise_loads = prepared
 
     def flush_layerwise_loads(self, request_ids: List[str]) -> None:
         """Submit the admitted compute batch through the existing graph merger.

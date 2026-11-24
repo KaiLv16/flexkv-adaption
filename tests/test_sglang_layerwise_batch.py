@@ -7,10 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
-from flexkv.integration.sglang.comm import FlexKVLayerDoneCounter
+from flexkv.integration.sglang.comm import FlexKVLayerDoneCounter, FlexKVScatterChannel
 from flexkv.integration.sglang.connector import FlexKVConnector
 
 pytestmark = pytest.mark.unit
@@ -60,6 +61,52 @@ def consume(c, producer):
         os.eventfd_write(fd, 1)
         c.layer_done_counter.wait_until(layer)
     assert c.layer_done_counter.consumer_index == -1
+
+
+def test_batch_lookup_shares_results_once_and_preserves_pending_ownership(connector):
+    c = connector
+    c.page_size = 2
+    c._pending_lookups["hit"] = 40
+    c._prefetch_result_sessions = {"hit": "prefetch-handle"}
+    c.kv_manager.get_match.side_effect = [
+        (41, np.array([False, False, True, True])),
+        (42, np.array([False, False, True, False])),
+        RuntimeError("lookup failed"),
+    ]
+    c._sync_ctx.needs_sync = True
+    c._sync_ctx.scatter = MagicMock(side_effect=lambda payload, **_: payload)
+    queries = [
+        (key, lambda: [10, 11, 12, 13], 2, 4, key, ["namespace"])
+        for key in ("hit", "short", "failed")
+    ]
+
+    assert c.lookup_kv_batch(queries) == [(41, 2), (42, 0), (-1, 0)]
+    payload, = c._sync_ctx.scatter.call_args.args
+    c._sync_ctx.scatter.assert_called_once_with(
+        payload, channel=FlexKVScatterChannel.LOOKUP_BATCH
+    )
+    assert c.kv_manager.get_match.call_count == 3
+    for call in c.kv_manager.get_match.call_args_list:
+        assert call.kwargs["token_mask"].tolist() == [False, False, True, True]
+        assert call.kwargs["namespace"] == ["namespace"]
+    assert c._pending_lookups == {"hit": 41}
+    c.kv_manager.release_prefetch.assert_called_once_with("prefetch-handle")
+    assert [call.args[0] for call in c.kv_manager.cancel.call_args_list] == [[42], [40]]
+    c.kv_manager.launch.assert_not_called()
+
+    def follower_tokens():
+        pytest.fail("The follower must not build query tokens")
+
+    c._sync_ctx.is_sync_leader = False
+    c._sync_ctx.scatter = MagicMock(return_value=payload)
+    c.kv_manager.get_match.reset_mock()
+    c._pending_lookups.clear()
+    assert c.lookup_kv_batch([]) == []
+    follower_queries = [(q[0], follower_tokens, *q[2:]) for q in queries]
+    assert c.lookup_kv_batch(follower_queries) == [(41, 2), (42, 0), (-1, 0)]
+    c._sync_ctx.scatter.assert_called_once()
+    c.kv_manager.get_match.assert_not_called()
+    assert c._pending_lookups == {"hit": 41}
 
 
 @pytest.mark.parametrize("local_ready", [False, True])
@@ -176,14 +223,15 @@ def test_launch_transport_failure_cannot_free_potential_dma_targets(connector):
     c.kv_manager.cancel.assert_not_called()
 
 
-@pytest.mark.parametrize("mismatch", [None, "batch", "slots"])
-def test_four_rank_protocol_agrees_before_single_leader_launch(mismatch):
+@pytest.mark.parametrize("case", [None, "individual", "batch", "empty", "slots", "registration"])
+def test_four_rank_protocol_agrees_before_single_leader_launch(case):
     # Synchronous collectives are simulated; eventfd state is real on each rank.
     fixtures = [connector.__wrapped__() for _ in range(4)]
     ranks = [next(f) for f in fixtures]
     barrier = threading.Barrier(4, timeout=5)
     payload = [None]
     votes = [None] * 4
+    mismatch = case if case != "individual" else None
     def context(rank):
         def scatter(value, **kwargs):
             if rank == 0:
@@ -206,18 +254,53 @@ def test_four_rank_protocol_agrees_before_single_leader_launch(mismatch):
     for i, c in enumerate(ranks):
         c._sync_ctx = context(i)
         c._cache_layer_split = True
+        c._sync_ctx.scatter = MagicMock(wraps=c._sync_ctx.scatter)
+        c._sync_ctx.all_reduce_min = MagicMock(wraps=c._sync_ctx.all_reduce_min)
+    if mismatch == "registration":
+        counter = ranks[2].layer_done_counter
+        register = counter.register_task_with_explicit_counter_id
+
+        def reject_second(task_id, producer_id):
+            if task_id == 2:
+                raise RuntimeError("injected registration failure")
+            register(task_id, producer_id)
+
+        counter.register_task_with_explicit_counter_id = reject_second
+
     def run(rank):
         c = ranks[rank]
-        if mismatch == "slots":
-            c._pending_lookups["a"] = 1
-            start = 100 if rank == 2 else 0
-            assert c.start_load_kv_layerwise(
-                "a", torch.arange(start, start + 4), defer_launch=True
-            ) == (0, -1)
+        work = [("a", 1), ("b", 2), ("c", 3)]
+        if mismatch == "empty" and rank == 2:
+            work = []
+        items = []
+        for rid, tid in work:
+            c._pending_lookups[rid] = tid
+            start = tid * 10 + (100 if mismatch == "slots" and rank == 2 and tid == 2 else 0)
+            items.append((rid, torch.arange(start, start + 4)))
+        if mismatch in ("empty", "slots", "registration"):
+            with pytest.raises(RuntimeError, match="preparation rejected"):
+                c.prepare_layerwise_loads(items)
             assert not c._prepared_layerwise_loads
+            assert not c._pending_lookups
+            assert c.layer_done_counter.consumer_index == -1
+            c._sync_ctx.scatter.assert_called_once()
+            assert c._sync_ctx.all_reduce_min.call_count == 2  # preflight and rollback
             return
-        for rid, tid in [("a", 1), ("b", 2), ("c", 3)]:
-            _, producer = prepare(c, rid, tid)
+        if case == "individual":
+            for rid, slots in items:
+                loaded, _ = c.start_load_kv_layerwise(rid, slots, defer_launch=True)
+                assert loaded == slots.numel()
+            assert c._sync_ctx.scatter.call_count == len(items)
+            assert [call.args for call in c._sync_ctx.all_reduce_min.call_args_list] == [
+                (1,),
+            ] * len(items)
+        else:
+            c.prepare_layerwise_loads(items)
+            c._sync_ctx.scatter.assert_called_once()
+            c._sync_ctx.all_reduce_min.assert_called_once_with(1)
+        producers = {p.producer_id for p in c._prepared_layerwise_loads.values()}
+        assert len(producers) == 1
+        producer = producers.pop()
         rids = ["a", "b"] if mismatch and rank == 2 else ["a", "b", "c"]
         if mismatch:
             with pytest.raises(RuntimeError):
@@ -229,8 +312,8 @@ def test_four_rank_protocol_agrees_before_single_leader_launch(mismatch):
         with ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(run, range(4)))
         assert ranks[0].kv_manager.launch.call_count == (0 if mismatch else 1)
-        if mismatch == "slots":
-            ranks[0].kv_manager.cancel.assert_called_once_with([1])
+        if mismatch in ("empty", "slots", "registration"):
+            assert [call.args[0] for call in ranks[0].kv_manager.cancel.call_args_list] == [[1], [2], [3]]
         for c in ranks[1:]:
             c.kv_manager.launch.assert_not_called()
     finally:

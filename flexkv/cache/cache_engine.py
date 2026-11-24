@@ -1402,7 +1402,7 @@ class GlobalCacheEngine:
             dp_client_id=dp_client_id,
             staged_predecessors=skip_ops,
         )
-        return transfer_graph, h2d_ops[-1].op_id, cpu_blocks
+        return transfer_graph, h2d_ops[len(h2d_ops) - 1].op_id, cpu_blocks
 
     @staticmethod
     def _build_get_h2d_ops(transfer_graph: TransferOpGraph,
