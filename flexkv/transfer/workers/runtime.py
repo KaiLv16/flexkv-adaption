@@ -699,7 +699,7 @@ class TransferWorkerBase(ABC):
                                             color=get_nvtx_range_color(op.transfer_graph_id))
                         nvtx_pushed = True
                         if batch_results and op.transfer_op_id in batch_results:
-                            transfer_status = batch_results[op.transfer_op_id]
+                            transfer_status, transfer_start_ns, _ = batch_results[op.transfer_op_id]
                         else:
                             transfer_status = self.launch_transfer(op)
                     except Exception as e:
@@ -728,6 +728,8 @@ class TransferWorkerBase(ABC):
                         if nvtx_pushed:
                             nvtx.pop_range()
                     launched_ns = time.perf_counter_ns()
+                    if batch_results and op.transfer_op_id in batch_results:
+                        launched_ns = batch_results[op.transfer_op_id][2]
                     # Metrics are diagnostics: they must never decide whether
                     # a result is reported. Before this guard, a throw here
                     # (or anywhere below) escaped to the outer handler and

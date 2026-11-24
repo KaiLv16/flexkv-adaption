@@ -89,7 +89,9 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         if any(op.transfer_type != ops[0].transfer_type for op in ops):
             return {}
         start = time.time()
+        start_ns = time.perf_counter_ns()
         results = self._backend.try_transfer_batch(self, ops)
+        end_ns = time.perf_counter_ns()
         end = time.time()
         completions = {}
         for op, flags in zip(ops, results):
@@ -99,8 +101,10 @@ class CPURemoteTransferWorker(TransferWorkerBase):
                 )
             except Exception:
                 flexkv_logger.exception("Failed to log Mooncake batch member %s", op.transfer_op_id)
-            completions[op.transfer_op_id] = WorkerTransferResult(
-                transfer_op_id=op.transfer_op_id, block_results=flags
+            completions[op.transfer_op_id] = (
+                WorkerTransferResult(transfer_op_id=op.transfer_op_id, block_results=flags),
+                start_ns,
+                end_ns,
             )
         return completions
 
