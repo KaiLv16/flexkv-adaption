@@ -1112,6 +1112,53 @@ class MooncakeStoreBackend(StorageBackend):
             "MooncakeStoreBackend reports per-block results; the worker must "
             "call transfer_blocks")
 
+    def try_transfer_batch(self, worker, ops):
+        """Issue one SDK request for independent whole-page transfers."""
+        direction = ops[0].transfer_type
+        if direction not in (TransferType.H2REMOTE, TransferType.REMOTE2H):
+            return []
+        counts = [int(op.valid_block_num) for op in ops]
+        if sum(counts) * self.block_size_bytes > 512 * 1024 * 1024:
+            return []
+        if direction == TransferType.REMOTE2H and is_mooncake_fault_inject_enabled():
+            return []
+        pointers, sizes, keys = [], [], []
+        try:
+            for op, count in zip(ops, counts):
+                src, dst = worker.get_transfer_block_ids(op, pinned=False)
+                op_ptrs, op_sizes, op_keys = self._keys_and_ptrs(op, src, dst)
+                if len(op_keys) != count:
+                    return []
+                pointers.extend(op_ptrs)
+                sizes.extend(op_sizes)
+                keys.extend(op_keys)
+        except Exception:
+            # No SDK call was made. The original per-op path handles bad ops.
+            return []
+        if direction == TransferType.H2REMOTE:
+            if len(set(keys)) != len(keys):
+                return []
+            call = self.mooncake_client.batch_put
+        else:
+            if len(set(pointers)) != len(pointers):
+                return []
+            call = self.mooncake_client.batch_get
+
+        # Once submitted, do not replay a potentially partial operation.
+        try:
+            flags = tuple(bool(ok) for ok in call(keys, pointers, sizes))
+            if len(flags) != len(keys):
+                raise RuntimeError("Mooncake returned an incorrect number of block results")
+        except Exception:
+            flexkv_logger.exception("Mooncake batched transfer failed")
+            flags = (False,) * len(keys)
+        results = []
+        offset = 0
+        for count in counts:
+            results.append(flags[offset:offset + count])
+            offset += count
+        return results
+
     def transfer_blocks(
         self,
         worker: TransferWorkerBase,

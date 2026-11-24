@@ -684,6 +684,8 @@ class TransferWorkerBase(ABC):
                     if not isinstance(op, dict):
                         op._received_ns = time.perf_counter_ns()
                     batch_ops.append(op)
+                launch_batch = getattr(self, "_launch_transfer_batch", None)
+                batch_results = launch_batch(batch_ops) if launch_batch else None
                 for op in batch_ops:
                     if isinstance(op, dict) and op.get("type") == "control":
                         self._reply_control(op)
@@ -696,7 +698,10 @@ class TransferWorkerBase(ABC):
                                             f"graph_id: {op.transfer_graph_id}",
                                             color=get_nvtx_range_color(op.transfer_graph_id))
                         nvtx_pushed = True
-                        transfer_status = self.launch_transfer(op)
+                        if batch_results and op.transfer_op_id in batch_results:
+                            transfer_status = batch_results[op.transfer_op_id]
+                        else:
+                            transfer_status = self.launch_transfer(op)
                     except Exception as e:
                         is_layerwise = op.transfer_type == TransferType.LAYERWISE
                         direction = "H2D" if is_layerwise else op.transfer_type.value
