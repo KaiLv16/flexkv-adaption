@@ -24,9 +24,9 @@ inline void bind(py::module_ &m, py::class_<RegionBatchGroup> &batch) {
 #endif
   py::register_exception<UnsafeTransfer>(m, "UnsafeGdrTransfer");
   py::class_<Transport>(m, "GdrOwnerEndpoint")
-      .def(py::init([](int device, const std::string &nic, int depth) {
+      .def(py::init([](int device, const std::string &nic, int depth, size_t qp_count) {
         const c10::cuda::CUDAGuard guard(device);
-        return std::unique_ptr<Transport>(new Transport(device, false, nic, "", depth, 0));
+        return std::unique_ptr<Transport>(new Transport(device, false, nic, "", depth, 0, qp_count));
       }))
       .def("export_tensor", [](Transport &transport, const torch::Tensor &tensor) {
         TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous(),
@@ -43,27 +43,27 @@ inline void bind(py::module_ &m, py::class_<RegionBatchGroup> &batch) {
       .def("release", &Transport::release);
   py::class_<PendingSender>(m, "GdrSender")
       .def(py::init([](int device, const std::string &nic,
-                       const std::string &endpoint, int depth, int readbacks) {
+                       const std::string &endpoint, int depth, int readbacks, size_t qp_count) {
         const c10::cuda::CUDAGuard guard(device);
         return PendingSender{
-            std::unique_ptr<Transport>(new Transport(device, true, nic, endpoint, depth, readbacks))};
+            std::unique_ptr<Transport>(new Transport(device, true, nic, endpoint, depth, readbacks, qp_count))};
       }))
-      .def_property_readonly("qpn", [](PendingSender &sender) {
-        return sender.transport->sender_qpn();
+      .def_property_readonly("qpns", [](PendingSender &sender) {
+        return sender.transport->sender_qpns();
       })
       .def("register_host", [](PendingSender &sender, const torch::Tensor &tensor) {
         TORCH_CHECK(tensor.device().is_cpu() && tensor.is_contiguous(),
                     "GDR requires a contiguous Host pool");
         sender.transport->register_host(tensor.data_ptr(), tensor.nbytes());
       })
-      .def("connect", [](PendingSender &sender, uint32_t target,
+      .def("connect", [](PendingSender &sender, const std::vector<uint32_t> &targets,
                          const std::vector<std::tuple<uintptr_t, size_t, uint64_t, uint32_t>> &views) {
         std::vector<RemoteRegion> regions;
         regions.reserve(views.size());
         for (const auto &view : views)
           regions.push_back({std::get<0>(view), std::get<1>(view),
                              std::get<2>(view), std::get<3>(view)});
-        sender.transport->connect(target, std::move(regions));
+        sender.transport->connect(targets, std::move(regions));
       });
 
   m.def("gdr_producer_ready", [](int device) {

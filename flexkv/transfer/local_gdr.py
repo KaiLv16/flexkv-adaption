@@ -7,7 +7,7 @@ import socket
 import tempfile
 import threading
 
-_PROTOCOL = "flexkv-local-gdr-1"
+_PROTOCOL = "flexkv-local-gdr-2"
 _TIMEOUT = 30
 _owners = set()
 _PEER_CLOSED = select.POLLHUP | select.POLLERR | getattr(select, "POLLRDHUP", 0)
@@ -22,6 +22,19 @@ def enabled(direction=None):
     if mode not in {"off", "h2d", "d2h", "both"}:
         raise ValueError("FLEXKV_LOCAL_GDR must be off, h2d, d2h, or both")
     return mode != "off" if direction is None else mode in {direction, "both"}
+
+
+def _qp_count():
+    count = int(os.environ.get("FLEXKV_GDR_QP_COUNT", "1"))
+    if not 1 <= count <= 16:
+        raise ValueError("FLEXKV_GDR_QP_COUNT must be 1..16")
+    return count
+
+
+def _valid_qpns(values, count):
+    return (isinstance(values, list) and len(values) == count
+            and all(type(qpn) is int and 0 < qpn <= 0xFFFFFF for qpn in values)
+            and len(set(values)) == count)
 
 
 def _read(stream):
@@ -60,7 +73,8 @@ class Owner:
         if (enabled("h2d") and c_ext.gdr_uses_mapped_memory
                 and os.environ.get("FLEXKV_GDR_EXPERIMENTAL_MAPPED_H2D") != "1"):
             raise RuntimeError("Mapped GDR H2D requires FLEXKV_GDR_EXPERIMENTAL_MAPPED_H2D=1")
-        self.endpoint = c_ext.GdrOwnerEndpoint(self.device, nic, depth)
+        self.qp_count = _qp_count()
+        self.endpoint = c_ext.GdrOwnerEndpoint(self.device, nic, depth, self.qp_count)
         if enabled("h2d"):
             c_ext.gdr_device_visible(self.device)
         # Cache the negotiated endpoint once so a link fault during registration
@@ -121,23 +135,24 @@ class Owner:
     def _session(self, conn):
         from flexkv import c_ext
 
-        qpn = None
+        targets = []
         posted_possible = False
         try:
             with conn, conn.makefile("rwb") as stream:
                 conn.settimeout(_TIMEOUT)
                 request = _read(stream)
-                sender = request.get("qpn")
+                senders = request.get("qpns")
                 if (request.get("protocol") != _PROTOCOL or
                         request.get("endpoint") != self.fingerprint or
                         request.get("depth") != self.endpoint.read_depth or
-                        type(sender) is not int or not 0 < sender <= 0xFFFFFF):
+                        not _valid_qpns(senders, self.qp_count)):
                     raise RuntimeError("GDR endpoint handshake mismatch")
                 with self.lock:
                     if self.retiring or self.uncertain:
                         raise RuntimeError("GDR owner no longer accepting leases")
-                    qpn = self.endpoint.accept(sender)
-                _write(stream, {"protocol": _PROTOCOL, "qpn": qpn})
+                    for sender in senders:
+                        targets.append(self.endpoint.accept(sender))
+                _write(stream, {"protocol": _PROTOCOL, "qpns": targets})
                 if stream.read(1) != b"C":
                     return
                 # The sender can post only after acknowledging connection and
@@ -156,8 +171,9 @@ class Owner:
                         c_ext.gdr_device_visible(self.device)
                     elif command == b"D":
                         with self.lock:
-                            self.endpoint.release(qpn)
-                            qpn = None
+                            while targets:
+                                self.endpoint.release(targets[-1])
+                                targets.pop()
                             self.confirmed_sockets.discard(conn)
                         stream.write(b"A")
                         stream.flush()
@@ -171,17 +187,18 @@ class Owner:
         finally:
             with self.lock:
                 self.confirmed_sockets.discard(conn)
-                if qpn is not None:
+                if targets:
                     if posted_possible:
                         # A dropped connection does not revoke DMA. Retain the
                         # original allocation and its target until isolation.
                         self.uncertain = True
                         self._log.error("Local GDR Owner lease lost; allocation retained")
                     else:
-                        try:
-                            self.endpoint.release(qpn)
-                        except Exception:
-                            self.uncertain = True
+                        for target in targets:
+                            try:
+                                self.endpoint.release(target)
+                            except Exception:
+                                self.uncertain = True
                 self.sessions.discard(threading.current_thread())
 
     def check_healthy(self):
@@ -245,6 +262,7 @@ def attach_routes(group, devices, tensors, host_tensors):
 
     leases = []
     confirmed = []
+    qp_count = _qp_count()
     readbacks = int(os.environ.get("FLEXKV_GDR_READBACKS", "0"))
     if not 0 <= readbacks <= 16:
         raise ValueError("FLEXKV_GDR_READBACKS must be 0 (auto) or 1..16")
@@ -269,7 +287,7 @@ def attach_routes(group, devices, tensors, host_tensors):
             if identity is None:
                 raise RuntimeError(f"GDR: GPU {device} has no Owner views")
             path, nic, fingerprint, depth = identity
-            sender = c_ext.GdrSender(device, nic, fingerprint, depth, readbacks)
+            sender = c_ext.GdrSender(device, nic, fingerprint, depth, readbacks, qp_count)
             for host in host_tensors:
                 sender.register_host(host)
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -278,18 +296,19 @@ def attach_routes(group, devices, tensors, host_tensors):
             conn.connect(path)
             with conn.makefile("rwb") as stream:
                 _write(stream, {"protocol": _PROTOCOL, "endpoint": fingerprint,
-                                "depth": depth, "qpn": sender.qpn})
+                                "depth": depth, "qpns": sender.qpns})
                 reply = _read(stream)
-                if reply.get("protocol") != _PROTOCOL:
-                    raise RuntimeError("GDR: Owner protocol mismatch")
-                sender.connect(reply["qpn"], list(views))
+                targets = reply.get("qpns")
+                if reply.get("protocol") != _PROTOCOL or not _valid_qpns(targets, qp_count):
+                    raise RuntimeError("GDR: Owner QP handshake mismatch")
+                sender.connect(targets, list(views))
             group.install_gdr_route(rank, sender, conn.fileno())
             conn.sendall(b"C")
             if conn.recv(1) != b"A":
                 raise RuntimeError("GDR: Owner did not confirm the lease")
             confirmed.append(conn)
-            flexkv_logger.info("Local GDR route ready: rank=%s device=%s nic=%s depth=%s",
-                               rank, device, nic, depth)
+            flexkv_logger.info("Local GDR route ready: rank=%s device=%s nic=%s qps=%s read_depth=%s",
+                               rank, device, nic, qp_count, depth)
     except BaseException:
         try:
             close_routes(group, confirmed)

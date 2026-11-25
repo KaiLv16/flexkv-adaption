@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Local RC endpoint setup is based on FlexKV PR #348.
 #include "gdr/transport.h"
+#include "gdr/cq_watchdog.h"
 #include "gdr/topology.h"
 
 #include <algorithm>
@@ -83,14 +84,37 @@ struct Transport::Impl {
     bool read;
     uint32_t bytes;
     int scratch;
-    uint64_t fence;
     bool signaled;
+  };
+
+  static constexpr size_t kPostBatch = 16;
+  static constexpr size_t kScratchStride = 64;
+  static constexpr size_t kMaxFences = 16;
+  static constexpr size_t kScratchBytes = kMaxFences * kScratchStride;
+  static constexpr unsigned kQpIndexBits = 4;
+  static_assert(kMaxQps == (1u << kQpIndexBits), "QP index must fit in WR id");
+
+  struct Queue {
+    ibv_qp *qp = nullptr;
+    std::array<ibv_send_wr, kPostBatch> wrs{};
+    std::array<ibv_sge, kPostBatch> sges{};
+    std::vector<Operation> ledger;
+    std::array<bool, kMaxFences> scratch_used{};
+    Span last_write{};
+    uint64_t posted = 0;
+    uint64_t retired = 0;
+    uint64_t last_checked = 0;
+    uint64_t payload_bytes = 0;
+    int reads = 0;
+    int fences = 0;
+    bool needs_readback = false;
+    CqWatchdog watchdog{std::chrono::seconds(30)};
   };
 
   ibv_context *ctx = nullptr;
   ibv_pd *pd = nullptr;
   ibv_cq *cq = nullptr;
-  ibv_qp *qp = nullptr;
+  std::vector<Queue> queues;
   std::vector<ibv_qp *> targets;
   std::vector<Mr> hosts, devices;
   std::vector<RemoteRegion> remote_regions;
@@ -108,29 +132,15 @@ struct Transport::Impl {
   size_t host_hint = 0;
   size_t remote_hint = 0;
 
-  static constexpr size_t kPostBatch = 16;
-  static constexpr size_t kScratchStride = 64;
-  static constexpr size_t kMaxFences = 16;
-  std::array<ibv_send_wr, kPostBatch> wrs{};
-  std::array<ibv_sge, kPostBatch> sges{};
-  std::vector<Operation> ledger;
-  std::array<bool, kMaxFences> scratch_used{};
-  static constexpr size_t kScratchBytes = kMaxFences * kScratchStride;
-  std::array<unsigned char, kScratchBytes + kScratchStride - 1> scratch_storage{};
+  std::vector<unsigned char> scratch_storage;
   unsigned char *scratch = nullptr;
   ibv_mr *scratch_mr = nullptr;
   int fence_depth = 0;
-  uint64_t posted = 0;
-  uint64_t retired = 0;
-  uint64_t fence_retired = 0;
-  uint64_t fence_posted = 0;
-  uint64_t payload_bytes = 0;
-  int reads = 0;
-  int fences = 0;
   Stats stats{};
 
   ~Impl() {
-    if (qp) ibv_destroy_qp(qp);
+    for (const auto &queue : queues)
+      if (queue.qp) ibv_destroy_qp(queue.qp);
     for (auto *target : targets) ibv_destroy_qp(target);
     if (scratch_mr) ibv_dereg_mr(scratch_mr);
     for (auto &mr : hosts) ibv_dereg_mr(mr.mr);
@@ -216,22 +226,55 @@ struct Transport::Impl {
     throw std::invalid_argument("GDR: address outside the registered regions");
   }
 
-  void post(size_t count) {
-    if (posted > std::numeric_limits<uint64_t>::max() - count)
+  uint64_t wr_id(uint64_t sequence, size_t index) {
+    if (sequence > (std::numeric_limits<uint64_t>::max() >> kQpIndexBits))
       fail("WR sequence overflow");
+    return (sequence << kQpIndexBits) | index;
+  }
+
+  void post(Queue &queue, size_t count) {
     ibv_send_wr *bad = nullptr;
-    const int error = ibv_post_send(qp, wrs.data(), &bad);
+    const int error = ibv_post_send(queue.qp, queue.wrs.data(), &bad);
     if (error) {
       // A failed post may have accepted a prefix. No caller may destroy the
       // route, reuse memory, or replay until the session has been isolated.
       size_t accepted = 0;
-      while (accepted < count && &wrs[accepted] != bad) ++accepted;
-      posted += accepted;
+      while (accepted < count && &queue.wrs[accepted] != bad) ++accepted;
+      queue.posted += accepted;
       fail("post_send failed; possible accepted prefix=" + std::to_string(accepted) +
            ", error=" + std::to_string(error));
     }
-    posted += count;
+    queue.posted += count;
     ++stats.posts;
+  }
+
+  bool post_readback(size_t index) {
+    auto &queue = queues[index];
+    if (queue.fences == fence_depth || queue.reads == read_depth ||
+        queue.posted - queue.retired >= static_cast<size_t>(depth)) return false;
+    const auto free = std::find(queue.scratch_used.begin(), queue.scratch_used.end(), false);
+    const auto slot = static_cast<int>(free - queue.scratch_used.begin());
+    const auto seq = queue.posted + 1;
+    const auto &last = queue.last_write;
+    queue.sges[0] = {reinterpret_cast<uint64_t>(scratch + index * kScratchBytes +
+                                               slot * kScratchStride),
+                     std::min(last.bytes, uint32_t(8)), scratch_mr->lkey};
+    auto &wr = queue.wrs[0];
+    wr = {};
+    wr.wr_id = wr_id(seq, index);
+    wr.sg_list = &queue.sges[0];
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = last.remote;
+    wr.wr.rdma.rkey = last.rkey;
+    queue.ledger[seq % depth] = {seq, true, 0, slot, true};
+    post(queue, 1);
+    *free = true;
+    ++queue.reads;
+    ++queue.fences;
+    ++stats.readbacks;
+    return true;
   }
 };
 
@@ -239,8 +282,9 @@ constexpr size_t Transport::Impl::kPostBatch;
 
 Transport::Transport(int device, bool sender, const std::string &nic,
                      const std::string &required_endpoint, int requested_depth,
-                     int requested_fences) : p_(new Impl) {
+                     int requested_fences, size_t qp_count) : p_(new Impl) {
   auto &e = *p_;
+  require(qp_count >= 1 && qp_count <= kMaxQps, "QP count must be 1..16");
   e.sender = sender;
   require(cudaSetDevice(device) == cudaSuccess, "cudaSetDevice failed");
   // Workers spawn a fresh interpreter. An Owner may already have live MRs
@@ -322,7 +366,8 @@ Transport::Transport(int device, bool sender, const std::string &nic,
   ibv_device_attr attr{};
   require(ibv_query_device(e.ctx, &attr) == 0, "query_device failed");
   e.max_mr_size = attr.max_mr_size;
-  e.depth = std::min({256, attr.max_qp_wr, attr.max_cqe});
+  const auto count = static_cast<int>(qp_count);
+  e.depth = std::min({256, attr.max_qp_wr, attr.max_cqe / count});
   const int capacity = std::min({128, attr.max_qp_rd_atom, attr.max_qp_init_rd_atom});
   require(e.depth > 1 && capacity > 0 && e.port.max_msg_sz, "insufficient SQ/CQ or READ capacity");
   require(requested_depth >= 0 && requested_depth <= capacity, "invalid READ depth");
@@ -338,16 +383,17 @@ Transport::Transport(int device, bool sender, const std::string &nic,
 #endif
   e.pd = ibv_alloc_pd(e.ctx);
   require(e.pd, "alloc_pd failed");
-  e.cq = ibv_create_cq(e.ctx, e.depth, nullptr, nullptr, 0);
+  e.cq = ibv_create_cq(e.ctx, sender ? e.depth * count : e.depth, nullptr, nullptr, 0);
   require(e.cq, "create_cq failed");
-  e.ledger.resize(e.depth);
   if (sender && e.fence_depth) {
+    const auto scratch_bytes = qp_count * Impl::kScratchBytes;
+    e.scratch_storage.resize(scratch_bytes + Impl::kScratchStride - 1);
     void *scratch = e.scratch_storage.data();
     size_t space = e.scratch_storage.size();
     e.scratch = static_cast<unsigned char *>(std::align(
-        Impl::kScratchStride, Impl::kScratchBytes, scratch, space));
+        Impl::kScratchStride, scratch_bytes, scratch, space));
     require(e.scratch, "cannot align read-back scratch storage");
-    e.scratch_mr = ibv_reg_mr(e.pd, e.scratch, Impl::kScratchBytes, IBV_ACCESS_LOCAL_WRITE);
+    e.scratch_mr = ibv_reg_mr(e.pd, e.scratch, scratch_bytes, IBV_ACCESS_LOCAL_WRITE);
     require(e.scratch_mr, "read-back scratch registration failed");
   }
   for (const auto &candidate : candidates) {
@@ -361,10 +407,16 @@ Transport::Transport(int device, bool sender, const std::string &nic,
     e.endpoint = std::string(registration) + "|" + bdf + "|" + e.name + "|" + port_string + "|" + std::to_string(e.gid_index) + "|" +
                  std::to_string(e.port.active_mtu) + "|" + std::to_string(e.port.lid);
     for (auto byte : e.gid.raw) e.endpoint += "|" + std::to_string(byte);
+    e.endpoint += "|" + std::to_string(qp_count);
     if (!required_endpoint.empty() && required_endpoint != e.endpoint) continue;
     if (sender) {
-      e.qp = e.create();
-      e.init_qp(e.qp);
+      e.queues.resize(qp_count);
+      e.stats.qp_payload_wrs.resize(qp_count);
+      for (auto &queue : e.queues) {
+        queue.ledger.resize(e.depth);
+        queue.qp = e.create();
+        e.init_qp(queue.qp);
+      }
     }
     return;
   }
@@ -374,7 +426,7 @@ Transport::Transport(int device, bool sender, const std::string &nic,
 // Until device-level isolation is established, preserve verbs resources after
 // any uncertainty. The owning process must also retain the backing memory.
 Transport::~Transport() {
-  if (p_ && (p_->unsafe || p_->posted != p_->retired)) (void)p_.release();
+  if (p_ && (p_->unsafe || has_outstanding())) (void)p_.release();
 }
 
 void Transport::register_device(void *p,size_t bytes) {
@@ -457,9 +509,11 @@ const std::string &Transport::endpoint() const {
 
 const std::string &Transport::nic() const { return p_->nic_selector; }
 int Transport::read_depth() const { return p_->read_depth; }
-uint32_t Transport::sender_qpn() const {
-  require(p_->qp, "sender QP does not exist");
-  return p_->qp->qp_num;
+std::vector<uint32_t> Transport::sender_qpns() const {
+  std::vector<uint32_t> qpns;
+  qpns.reserve(p_->queues.size());
+  for (const auto &queue : p_->queues) qpns.push_back(queue.qp->qp_num);
+  return qpns;
 }
 uint32_t Transport::accept(uint32_t sender) {
   require(!p_->sender, "unexpected target on sender route");
@@ -482,10 +536,11 @@ void Transport::release(uint32_t qpn) {
   targets.erase(target);
 }
 
-void Transport::connect(uint32_t target, std::vector<RemoteRegion> regions) {
+void Transport::connect(const std::vector<uint32_t> &targets, std::vector<RemoteRegion> regions) {
   auto &e = *p_;
   require(e.sender && !e.connected && !regions.empty() && !e.hosts.empty(),
           "invalid owner handshake");
+  require(targets.size() == e.queues.size(), "Owner QP count does not match sender");
   for (const auto &region : regions) {
     require(region.local && region.remote && region.bytes &&
             region.bytes <= UINTPTR_MAX - region.local &&
@@ -512,12 +567,12 @@ void Transport::connect(uint32_t target, std::vector<RemoteRegion> regions) {
       merged.push_back(region);
     }
   }
-  e.connect(e.qp, target, true);
+  for (size_t i = 0; i < targets.size(); ++i) e.connect(e.queues[i].qp, targets[i], true);
   e.remote_regions = std::move(merged);
   e.connected = true;
 }
 
-size_t Transport::resolve(uintptr_t host, uintptr_t device, size_t bytes, Span &out) {
+size_t Transport::resolve(uintptr_t host, uintptr_t device, size_t bytes, bool h2d, Span &out) {
   auto &e = *p_;
   require(e.connected && bytes, "invalid transfer span");
   auto host_base = [](const Mr &region) { return reinterpret_cast<uintptr_t>(region.ptr); };
@@ -525,117 +580,147 @@ size_t Transport::resolve(uintptr_t host, uintptr_t device, size_t bytes, Span &
   const auto &gm = e.lookup(e.remote_regions, e.remote_hint, device,
                             [](const RemoteRegion &region) { return region.local; });
   const auto device_offset = device - gm.local;
-  const size_t length = std::min({bytes, hm.bytes - (host - host_base(hm)),
+  size_t length = std::min({bytes, hm.bytes - (host - host_base(hm)),
       gm.bytes - device_offset, max_payload()});
-  out = {host, gm.remote + device_offset, static_cast<uint32_t>(length), hm.mr->lkey, gm.key};
+  const auto remote = gm.remote + device_offset;
+  size_t index = 0;
+  if (e.queues.size() > 1) {
+    // Assign by destination bytes. Overlapping writes must reach the same
+    // SQ in request order, even when a later span starts at a different offset.
+    constexpr size_t stripe_bytes = 64u << 10;
+    const uint64_t destination = h2d ? remote : host;
+    const auto stripe = destination / stripe_bytes;
+    index = (stripe ^ (stripe >> 4) ^ (stripe >> 8)) % e.queues.size();
+    length = std::min(length, static_cast<size_t>(stripe_bytes - destination % stripe_bytes));
+  }
+  out = {host, remote, static_cast<uint32_t>(length), hm.mr->lkey, gm.key,
+         static_cast<uint32_t>(index)};
   return length;
 }
 
 size_t Transport::post_payload(const Span *spans, size_t count, bool h2d) {
   auto &e = *p_;
   require(!e.unsafe && e.connected, "route not available");
-  const size_t depth = static_cast<size_t>(e.depth - (h2d ? e.fence_depth : 0));
-  const size_t payload_inflight = e.posted - e.retired - e.fences;
-  count = std::min({count, Impl::kPostBatch, depth - payload_inflight,
-      h2d ? Impl::kPostBatch : static_cast<size_t>(e.read_depth - e.reads)});
-  size_t bytes = 0;
+  count = std::min(count, Impl::kPostBatch);
+  std::array<size_t, kMaxQps> counts{};
+  std::array<size_t, kMaxQps> bytes{};
   size_t actual = 0;
   for (; actual < count; ++actual) {
     const auto &span = spans[actual];
-    if (e.payload_bytes + bytes + span.bytes > (16u << 20)) break;
-    const uint64_t seq = e.posted + actual + 1;
-    e.sges[actual] = {span.host, span.bytes, span.lkey};
-    auto &wr = e.wrs[actual];
+    const auto index = span.qp_index;
+    auto &queue = e.queues[index];
+    auto &slot = counts[index];
+    const size_t reserved = h2d ? e.fence_depth - queue.fences : 0;
+    const auto inflight = queue.posted - queue.retired;
+    if (inflight + slot >= e.depth - reserved ||
+        (!h2d && slot >= static_cast<size_t>(e.read_depth - queue.reads)) ||
+        queue.payload_bytes + bytes[index] + span.bytes > (16u << 20)) break;
+    const uint64_t seq = queue.posted + slot + 1;
+    queue.sges[slot] = {span.host, span.bytes, span.lkey};
+    auto &wr = queue.wrs[slot];
     wr = {};
-    wr.wr_id = seq;
-    wr.sg_list = &e.sges[actual];
+    wr.wr_id = e.wr_id(seq, index);
+    wr.sg_list = &queue.sges[slot];
     wr.num_sge = 1;
     wr.opcode = h2d ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
     wr.send_flags = h2d ? 0 : IBV_SEND_SIGNALED;
     wr.wr.rdma.remote_addr = span.remote;
     wr.wr.rdma.rkey = span.rkey;
-    if (actual) e.wrs[actual - 1].next = &wr;
-    e.ledger[seq % e.depth] = {seq, !h2d, span.bytes, -1, 0, !h2d};
-    bytes += span.bytes;
+    if (slot) queue.wrs[slot - 1].next = &wr;
+    queue.ledger[seq % e.depth] = {seq, !h2d, span.bytes, -1, !h2d};
+    bytes[index] += span.bytes;
+    ++slot;
+    if (h2d && e.fence_depth) queue.last_write = span;
   }
-  if (!actual) return 0;
-  // The tail CQE of an ordered RC write chain retires its unsignaled prefix.
-  if (h2d) {
-    e.wrs[actual - 1].send_flags = IBV_SEND_SIGNALED;
-    e.ledger[(e.posted + actual) % e.depth].signaled = true;
+  for (size_t i = 0; i < e.queues.size(); ++i) {
+    const auto n = counts[i];
+    if (!n) continue;
+    auto &queue = e.queues[i];
+    // A tail CQE retires only the earlier WRs on this SQ.
+    if (h2d) {
+      queue.wrs[n - 1].send_flags = IBV_SEND_SIGNALED;
+      queue.ledger[(queue.posted + n) % e.depth].signaled = true;
+    }
+    e.post(queue, n);
+    queue.payload_bytes += bytes[i];
+    if (!h2d) queue.reads += static_cast<int>(n);
+    queue.needs_readback |= h2d && e.fence_depth;
+    e.stats.payload_wrs += n;
+    e.stats.qp_payload_wrs[i] += n;
+    (h2d ? e.stats.h2d_bytes : e.stats.d2h_bytes) += bytes[i];
   }
-  e.post(actual);
-  e.payload_bytes += bytes;
-  if (!h2d) e.reads += static_cast<int>(actual);
-  e.stats.payload_wrs += actual;
-  (h2d ? e.stats.h2d_bytes : e.stats.d2h_bytes) += bytes;
   return actual;
 }
 
-bool Transport::post_readback(const Span &last_write, uint64_t fence) {
+bool Transport::finish_scope(TransferCheckpoint &checkpoint) {
   auto &e = *p_;
-  require(!e.unsafe && e.connected && e.fence_depth && fence > e.fence_posted,
-          "invalid read-back ordering checkpoint");
-  if (e.fences == e.fence_depth || e.reads == e.read_depth) return false;
-  const auto free = std::find(e.scratch_used.begin(), e.scratch_used.end(), false);
-  const int slot = static_cast<int>(free - e.scratch_used.begin());
-  const uint64_t seq = e.posted + 1;
-  e.sges[0] = {reinterpret_cast<uint64_t>(e.scratch + slot * Impl::kScratchStride),
-               std::min(last_write.bytes, uint32_t(8)), e.scratch_mr->lkey};
-  auto &wr = e.wrs[0];
-  wr = {};
-  wr.wr_id = seq;
-  wr.sg_list = &e.sges[0];
-  wr.num_sge = 1;
-  wr.opcode = IBV_WR_RDMA_READ;
-  wr.send_flags = IBV_SEND_SIGNALED;
-  wr.wr.rdma.remote_addr = last_write.remote;
-  wr.wr.rdma.rkey = last_write.rkey;
-  e.ledger[seq % e.depth] = {seq, true, 0, slot, fence, true};
-  e.post(1);
-  *free = true;
-  ++e.reads;
-  ++e.fences;
-  e.fence_posted = fence;
-  ++e.stats.readbacks;
+  bool ready = true;
+  for (size_t i = 0; i < e.queues.size(); ++i) {
+    auto &queue = e.queues[i];
+    if (queue.needs_readback && e.post_readback(i)) queue.needs_readback = false;
+    ready &= !queue.needs_readback;
+    checkpoint[i] = queue.posted;
+  }
+  return ready;
+}
+
+bool Transport::is_complete(const TransferCheckpoint &checkpoint) const {
+  const auto &queues = p_->queues;
+  for (size_t i = 0; i < queues.size(); ++i)
+    if (queues[i].retired < checkpoint[i]) return false;
   return true;
 }
 
 int Transport::poll() {
   auto &e = *p_;
-  if (e.posted == e.retired) return 0;
+  if (!has_outstanding()) return 0;
   ibv_wc wc[32];
   const int count = ibv_poll_cq(e.cq, 32, wc);
   if (count < 0) e.fail("poll_cq failed");
   for (int i = 0; i < count; ++i) {
     if (wc[i].status != IBV_WC_SUCCESS)
       e.fail("CQE failed, WC status=" + std::to_string(wc[i].status));
-    const auto seq = wc[i].wr_id;
-    if (seq <= e.retired || seq > e.posted || !e.ledger[seq % e.depth].signaled)
+    const auto index = wc[i].wr_id & (kMaxQps - 1);
+    const auto seq = wc[i].wr_id >> Impl::kQpIndexBits;
+    if (index >= e.queues.size() || wc[i].qp_num != e.queues[index].qp->qp_num)
+      e.fail("invalid CQE QP");
+    auto &queue = e.queues[index];
+    if (seq <= queue.retired || seq > queue.posted || !queue.ledger[seq % e.depth].signaled)
       e.fail("invalid CQE sequence");
-    while (e.retired < seq) {
-      const auto next = e.retired + 1;
-      const auto &op = e.ledger[next % e.depth];
+    while (queue.retired < seq) {
+      const auto next = queue.retired + 1;
+      const auto &op = queue.ledger[next % e.depth];
       if (op.sequence != next || op.signaled != (next == seq))
         e.fail("invalid CQE prefix");
-      e.payload_bytes -= op.bytes;
-      if (op.read) --e.reads;
+      queue.payload_bytes -= op.bytes;
+      if (op.read) --queue.reads;
       if (op.scratch >= 0) {
-        e.scratch_used[op.scratch] = false;
-        --e.fences;
-        e.fence_retired = op.fence;
+        queue.scratch_used[op.scratch] = false;
+        --queue.fences;
       }
-      e.retired = next;
+      queue.retired = next;
     }
   }
   e.stats.completions += count;
   return count;
 }
 
-uint64_t Transport::posted() const { return p_->posted; }
-uint64_t Transport::retired() const { return p_->retired; }
-uint64_t Transport::fence_retired() const { return p_->fence_retired; }
-bool Transport::requires_readback() const { return p_->fence_depth != 0; }
+bool Transport::has_outstanding() const {
+  for (const auto &queue : p_->queues)
+    if (queue.posted != queue.retired) return true;
+  return false;
+}
+
+void Transport::check_progress() {
+  auto &e = *p_;
+  const auto now = CqWatchdog::Clock::now();
+  for (auto &queue : e.queues) {
+    if (queue.watchdog.expired(now, queue.posted != queue.retired,
+                               queue.retired != queue.last_checked))
+      e.fail("timed out waiting for completions on QP " + std::to_string(queue.qp->qp_num));
+    queue.last_checked = queue.retired;
+  }
+}
 size_t Transport::max_payload() const { return std::min(size_t(p_->port.max_msg_sz), size_t(1u << 20)); }
 Stats Transport::stats() const { return p_->stats; }
 void Transport::mark_unsafe() { p_->unsafe = true; }

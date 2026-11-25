@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "gdr/region_adapter.h"
-#include "gdr/cq_watchdog.h"
 
 #include "device_thread_pool.h"
 #include "region_batch.h"
@@ -20,7 +19,6 @@ namespace gdr {
 namespace {
 
 constexpr size_t kWindow = 16;
-constexpr auto kCqTimeout = std::chrono::seconds(30);
 
 struct BlockAddress {
   const GTensorHandler &handler;
@@ -69,7 +67,7 @@ public:
     device = add(device, 1, a.gpu_startoff_inside_chunks);
     Span span;
     offset_ += transport.resolve(add(host, 1, offset_), add(device, 1, offset_),
-                                 a.chunk_size_in_bytes - offset_, span);
+                                 a.chunk_size_in_bytes - offset_, a.is_host_to_device, span);
     if (offset_ == static_cast<size_t>(a.chunk_size_in_bytes)) {
       offset_ = 0;
       if (++block_ == a.num_blocks) {
@@ -97,8 +95,7 @@ private:
 };
 
 struct Checkpoint {
-  uint64_t sequence;
-  uint64_t fence;
+  TransferCheckpoint tails;
   int milestone;
   bool needs_visibility;
   bool sent;
@@ -130,7 +127,6 @@ bool receive_ack(int fd) {
 struct RegionAdapter::Route {
   std::unique_ptr<Transport> sender;
   int control_fd = -1;
-  uint64_t next_fence = 0;
 
   ~Route() { if (control_fd >= 0) close(control_fd); }
 
@@ -139,7 +135,6 @@ struct RegionAdapter::Route {
            const std::function<void(int)> &rank_visible) {
     if (work.empty()) return;
     auto &transport = *sender;
-    CqWatchdog cq_watchdog(kCqTimeout);
     bool producer_sent = false;
     bool producer_ready = h2d;
     size_t region = 0;
@@ -147,7 +142,6 @@ struct RegionAdapter::Route {
     cursor.reset(work.front());
     std::array<Span, kWindow> spans;
     size_t first = 0, last = 0;
-    Span last_write{};
     std::array<Checkpoint, kWindow> checkpoints;
     size_t head = 0, tail = 0, next_visibility = 0;
     bool had_payload = false;
@@ -157,8 +151,7 @@ struct RegionAdapter::Route {
     while (region < work.size() || head != tail) {
       if (stop.load(std::memory_order_acquire) || stopped.load(std::memory_order_acquire))
         throw UnsafeTransfer("GDR: local transfer stopped");
-      const bool completed = transport.poll() > 0;
-      bool progress = completed;
+      bool progress = transport.poll() > 0;
       if (!producer_ready) {
         if (!producer_sent) {
           producer_sent = send_command(control_fd, 'R');
@@ -172,7 +165,7 @@ struct RegionAdapter::Route {
       // exists. A slow ACK retains only a checkpoint, never a CQ or SQ credit.
       while (next_visibility < tail) {
         auto &done = checkpoints[next_visibility % kWindow];
-        if (transport.retired() < done.sequence || transport.fence_retired() < done.fence) break;
+        if (!transport.is_complete(done.tails)) break;
         if (done.needs_visibility && !send_command(control_fd, 'V')) break;
         done.sent = true;
         ++next_visibility;
@@ -194,7 +187,7 @@ struct RegionAdapter::Route {
             const auto next = cursor.next(transport);
             if (last > 0) {
               auto &prev = spans[last - 1];
-              if (prev.lkey == next.lkey && prev.rkey == next.rkey &&
+              if (prev.qp_index == next.qp_index && prev.lkey == next.lkey && prev.rkey == next.rkey &&
                   prev.host + prev.bytes == next.host && prev.remote + prev.bytes == next.remote &&
                   next.bytes <= transport.max_payload() - prev.bytes) {
                 prev.bytes += next.bytes;
@@ -208,22 +201,19 @@ struct RegionAdapter::Route {
           const auto sent = transport.post_payload(spans.data() + first, last - first, h2d);
           first += sent;
           if (sent) {
-            last_write = spans[first - 1];
             had_payload = true;
             progress = true;
           }
         }
         if (first == last && cursor.empty()) {
           const bool scope_end = region + 1 == work.size() || work[region + 1].milestone != layer;
-          uint64_t fence = 0;
-          bool can_advance = true;
-          if (scope_end && had_payload && h2d && transport.requires_readback()) {
-            can_advance = transport.post_readback(last_write, next_fence + 1);
-            if (can_advance) fence = ++next_fence;
-          }
-          if (can_advance) {
+          auto &checkpoint = checkpoints[tail % kWindow];
+          if (!scope_end || transport.finish_scope(checkpoint.tails)) {
             if (scope_end) {
-              checkpoints[tail++ % kWindow] = {transport.posted(), fence, layer, h2d && had_payload, false};
+              checkpoint.milestone = layer;
+              checkpoint.needs_visibility = h2d && had_payload;
+              checkpoint.sent = false;
+              ++tail;
               had_payload = false;
             }
             if (++region < work.size()) cursor.reset(work[region]);
@@ -232,9 +222,8 @@ struct RegionAdapter::Route {
         }
       }
 
-      const bool outstanding = transport.posted() != transport.retired();
-      if (cq_watchdog.expired(CqWatchdog::Clock::now(), outstanding, completed))
-        throw UnsafeTransfer("GDR: timed out waiting for outstanding RDMA completions");
+      const bool outstanding = transport.has_outstanding();
+      transport.check_progress();
       if (progress) {
         idle = 0;
         backoff_us = 10;
@@ -333,6 +322,8 @@ std::vector<std::vector<uint64_t>> RegionBatchGroup::gdr_counters() const {
     for (const auto &route : gdr_->statistics()) {
       counters.push_back({route.h2d_bytes, route.d2h_bytes, route.payload_wrs,
                           route.posts, route.completions, route.readbacks});
+      auto &row = counters.back();
+      row.insert(row.end(), route.qp_payload_wrs.begin(), route.qp_payload_wrs.end());
     }
   }
   return counters;

@@ -437,7 +437,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
 
             if os.environ.get("FLEXKV_GDR_LOG_COUNTERS") == "1":
                 flexkv_logger.info("Local GDR route counters (H2D bytes, D2H bytes, "
-                                   "payload WRs, posts, CQEs, read-backs): %s",
+                                   "payload WRs, posts, CQEs, read-backs, per-QP payload WRs): %s",
                                    self.region_batch.gdr_counters())
             close_routes(self.region_batch, leases)
             leases.clear()

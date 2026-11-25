@@ -143,10 +143,17 @@ Set `FLEXKV_LOCAL_GDR=h2d`, `d2h` or `both` in the serving environment.
 The default is `off`. An enabled direction requires a complete local Owner
 registration. `FLEXKV_GDR_NICS` can specify a comma-separated `NIC` or
 `NIC:PORT` per local rank. Without `:PORT`, FlexKV uses the first active port.
+Set `FLEXKV_GDR_QP_COUNT=4` in both the Owner and Worker environments to use
+four RC QP pairs per GPU per enabled direction on that GPU's selected port.
+The default is `1` and the supported configuration range is `1` through `16`,
+subject to NIC queue capacity. With multiple QPs, destination address ranges
+are distributed across the QPs. A layer completes after every QP used by it
+has completed its work and the Owner has confirmed device visibility.
 `FLEXKV_GDR_READBACKS` sets the maximum mapped H2D read-backs in flight per
-route. `0` (default) chooses up to four within the available SQ and READ
+QP. `0` (default) chooses up to four within the available SQ and READ
 depth. An explicit value must fit those limits. `FLEXKV_GDR_READ_DEPTH`
-can request a particular READ depth.
+can request a particular READ depth per QP. Each QP has a 16 MiB in-flight
+payload limit.
 
 Mapped H2D is experimental and requires `FLEXKV_GDR_EXPERIMENTAL_MAPPED_H2D=1`.
 The read-back and runtime synchronization sequence needs validation of GPU
@@ -162,10 +169,11 @@ FLEXKV_LOCAL_GDR=h2d FLEXKV_ENABLE_CE_ONLY=1 \
 This backend needs platform acceptance before production use. Verify the
 actual model's merged layerwise restore, D2H, device ordering and isolation
 after a Worker or Owner failure. `FLEXKV_GDR_LOG_COUNTERS=1` reports per-route
-payload bytes, WRs, CQEs and read-backs on clean shutdown. The 30-second
-CQ watchdog runs only while RDMA WRs are outstanding and resets on CQ
-progress. A fault without proof of drain retains the registered buffers
-and requires platform isolation before their teardown or reuse.
+payload bytes, WRs, CQEs, read-backs and per-QP payload WR counts on clean
+shutdown. The 30-second per-QP watchdog runs only while RDMA WRs are
+outstanding and resets on CQ progress. A fault without proof of drain retains
+the registered buffers and requires platform isolation before their teardown
+or reuse.
 
 ### Use FlexKV with vLLM
 

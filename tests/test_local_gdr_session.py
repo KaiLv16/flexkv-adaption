@@ -28,11 +28,12 @@ class LocalGdrLeaseTest(unittest.TestCase):
         self.patch.start()
         self.addCleanup(self.patch.stop)
 
-    def start_lease(self):
+    def start_lease(self, qp_count=1, senders=None, accept=None):
         owner = local_gdr.Owner.__new__(local_gdr.Owner)
         owner._log = Mock()
         owner.device = 3
-        owner.endpoint = types.SimpleNamespace(read_depth=4, accept=Mock(return_value=8),
+        owner.qp_count = qp_count
+        owner.endpoint = types.SimpleNamespace(read_depth=4, accept=Mock(side_effect=accept or (lambda qpn: qpn + 16)),
                                                release=Mock())
         owner.fingerprint = "local"
         owner.lock = threading.Lock()
@@ -48,8 +49,12 @@ class LocalGdrLeaseTest(unittest.TestCase):
         self.addCleanup(caller.close)
         with caller.makefile("rwb") as stream:
             local_gdr._write(stream, dict(
-                protocol=local_gdr._PROTOCOL, endpoint="local", depth=4, qpn=7))
-            self.assertEqual(local_gdr._read(stream)["qpn"], 8)
+                protocol=local_gdr._PROTOCOL, endpoint="local", depth=4,
+                qpns=[7] if senders is None else senders))
+            if senders is None:
+                self.assertEqual(local_gdr._read(stream)["qpns"], [23])
+            elif accept is None:
+                self.assertEqual(local_gdr._read(stream)["qpns"], [qpn + 16 for qpn in senders])
         return owner, caller, thread
 
     def test_producer_visibility_and_explicit_drain(self):
@@ -61,7 +66,7 @@ class LocalGdrLeaseTest(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.native.gdr_producer_ready.assert_called_once_with(3)
         self.assertEqual(self.native.gdr_device_visible.call_count, 2)
-        owner.endpoint.release.assert_called_once_with(8)
+        owner.endpoint.release.assert_called_once_with(23)
         self.assertFalse(owner.uncertain)
 
     def test_confirmed_worker_loss_keeps_target_registered(self):
@@ -80,7 +85,30 @@ class LocalGdrLeaseTest(unittest.TestCase):
         thread.join(1)
         self.assertFalse(thread.is_alive())
         self.assertFalse(owner.uncertain)
-        owner.endpoint.release.assert_called_once_with(8)
+        owner.endpoint.release.assert_called_once_with(23)
+
+    def test_four_queues_drain_in_one_lease(self):
+        owner, caller, thread = self.start_lease(4, [4, 7, 5, 11])
+        caller.sendall(b"CD")
+        with caller.makefile("rwb") as stream:
+            self.assertEqual(stream.read(2), b"AA")
+        thread.join(1)
+        self.assertFalse(owner.uncertain)
+        self.assertEqual([call.args[0] for call in owner.endpoint.release.call_args_list],
+                         [27, 21, 23, 20])
+
+    def test_partial_handshake_releases_created_targets(self):
+        def accept(qpn):
+            if qpn == 5:
+                raise RuntimeError("test QP registration failure")
+            return qpn + 16
+
+        owner, caller, thread = self.start_lease(4, [4, 7, 5, 11], accept)
+        self.assertEqual(caller.recv(1), b"")
+        thread.join(1)
+        self.assertFalse(owner.uncertain)
+        self.assertEqual([call.args[0] for call in owner.endpoint.release.call_args_list],
+                         [20, 23])
 
     def test_peer_loss_detected_while_owner_waits_for_gpu(self):
         waiting = threading.Event()

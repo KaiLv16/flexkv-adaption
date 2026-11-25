@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cassert>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -28,9 +29,9 @@ struct ibv_send_wr {
   int num_sge, opcode, send_flags;
   struct { struct { uint64_t remote_addr; uint32_t rkey; } rdma; } wr;
 };
-struct ibv_wc { uint64_t wr_id; int status; };
+struct ibv_wc { uint64_t wr_id; int status; uint32_t qp_num; };
 struct FakeCopy { void *dst; const void *src; size_t bytes; };
-struct FakeCompletion { uint64_t tail; std::vector<FakeCopy> copies; };
+struct FakeCompletion { uint64_t tail; uint32_t qp_num; std::vector<FakeCopy> copies; };
 struct ibv_cq { std::deque<FakeCompletion> pending; };
 struct ibv_qp { uint32_t qp_num; ibv_cq *cq; int port; };
 struct ibv_qp_init_attr {
@@ -62,6 +63,7 @@ static ibv_device device;
 static ibv_device *devices[] = {&device};
 static uint32_t next_key = 1, next_qp = 1;
 static int live_qps = 0, reject_index = -1;
+static uint32_t blocked_qp = 0;
 static bool hold_cq = false, bad_sequence = false, cq_error = false;
 static std::map<uint32_t, ibv_mr *> registrations;
 }
@@ -124,7 +126,7 @@ inline int ibv_post_send(ibv_qp *qp, ibv_send_wr *wr, ibv_send_wr **bad) {
     const bool read = wr->opcode == IBV_WR_RDMA_READ;
     copies.push_back({read ? local : remote, read ? remote : local, sge.length});
     if (wr->send_flags & IBV_SEND_SIGNALED) {
-      qp->cq->pending.push_back({wr->wr_id, copies});
+      qp->cq->pending.push_back({wr->wr_id, qp->qp_num, copies});
       copies.clear();
     }
   }
@@ -132,10 +134,13 @@ inline int ibv_post_send(ibv_qp *qp, ibv_send_wr *wr, ibv_send_wr **bad) {
   return 0;
 }
 inline int ibv_poll_cq(ibv_cq *cq, int, ibv_wc *wc) {
-  if (fake::hold_cq || cq->pending.empty()) return 0;
-  const auto &completion = cq->pending.front();
-  for (const auto &copy : completion.copies) std::memcpy(copy.dst, copy.src, copy.bytes);
-  *wc = {completion.tail + (fake::bad_sequence ? 1 : 0), fake::cq_error ? 1 : IBV_WC_SUCCESS};
-  cq->pending.pop_front();
+  if (fake::hold_cq) return 0;
+  const auto done = std::find_if(cq->pending.begin(), cq->pending.end(),
+      [](const FakeCompletion &entry) { return entry.qp_num != fake::blocked_qp; });
+  if (done == cq->pending.end()) return 0;
+  for (const auto &copy : done->copies) std::memcpy(copy.dst, copy.src, copy.bytes);
+  *wc = {done->tail + (fake::bad_sequence ? 16 : 0),
+         fake::cq_error ? 1 : IBV_WC_SUCCESS, done->qp_num};
+  cq->pending.erase(done);
   return 1;
 }
