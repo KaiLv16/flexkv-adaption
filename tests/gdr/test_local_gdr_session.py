@@ -7,13 +7,16 @@ import sys
 import threading
 import types
 import unittest
+from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 
+source = Path(__file__).resolve().parents[2] / "flexkv" / "transfer" / "local_gdr.py"
+compiled = (source.with_name("local_gdr" + suffix) for suffix in EXTENSION_SUFFIXES)
+module_path = next((path for path in compiled if path.is_file()), source)
 spec = importlib.util.spec_from_file_location(
-    "local_gdr",
-    Path(__file__).resolve().parents[2] / "flexkv" / "transfer" / "local_gdr.py",
+    "local_gdr", module_path,
 )
 local_gdr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(local_gdr)

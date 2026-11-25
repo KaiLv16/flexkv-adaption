@@ -172,7 +172,7 @@ class Owner:
                     elif command == b"D":
                         with self.lock:
                             while targets:
-                                self.endpoint.release(targets[-1])
+                                self.endpoint.release(targets[len(targets) - 1])
                                 targets.pop()
                             self.confirmed_sockets.discard(conn)
                         stream.write(b"A")
