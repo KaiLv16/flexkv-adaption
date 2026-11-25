@@ -6,8 +6,10 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <pybind11/stl.h>
+#include <tuple>
 
-namespace flexkv::gdr {
+namespace flexkv {
+namespace gdr {
 namespace py = pybind11;
 
 struct PendingSender {
@@ -19,7 +21,7 @@ inline void bind(py::module_ &m, py::class_<RegionBatchGroup> &batch) {
   py::class_<Transport>(m, "GdrOwnerEndpoint")
       .def(py::init([](int device, const std::string &nic, int depth) {
         const c10::cuda::CUDAGuard guard(device);
-        return std::make_unique<Transport>(device, false, nic, "", depth, 0);
+        return std::unique_ptr<Transport>(new Transport(device, false, nic, "", depth, 0));
       }))
       .def("export_tensor", [](Transport &transport, const torch::Tensor &tensor) {
         TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous(),
@@ -39,7 +41,7 @@ inline void bind(py::module_ &m, py::class_<RegionBatchGroup> &batch) {
                        const std::string &endpoint, int depth, int readbacks) {
         const c10::cuda::CUDAGuard guard(device);
         return PendingSender{
-            std::make_unique<Transport>(device, true, nic, endpoint, depth, readbacks)};
+            std::unique_ptr<Transport>(new Transport(device, true, nic, endpoint, depth, readbacks))};
       }))
       .def_property_readonly("qpn", [](PendingSender &sender) {
         return sender.transport->sender_qpn();
@@ -53,8 +55,9 @@ inline void bind(py::module_ &m, py::class_<RegionBatchGroup> &batch) {
                          const std::vector<std::tuple<uintptr_t, size_t, uint64_t, uint32_t>> &views) {
         std::vector<RemoteRegion> regions;
         regions.reserve(views.size());
-        for (const auto &[local, bytes, remote, key] : views)
-          regions.push_back({local, bytes, remote, key});
+        for (const auto &view : views)
+          regions.push_back({std::get<0>(view), std::get<1>(view),
+                             std::get<2>(view), std::get<3>(view)});
         sender.transport->connect(target, std::move(regions));
       });
 
@@ -73,4 +76,5 @@ inline void bind(py::module_ &m, py::class_<RegionBatchGroup> &batch) {
       .def("stop_gdr", &RegionBatchGroup::stop_gdr)
       .def("gdr_counters", &RegionBatchGroup::gdr_counters);
 }
-}  // namespace flexkv::gdr
+}  // namespace gdr
+}  // namespace flexkv

@@ -305,13 +305,30 @@ enable_cputest = os.environ.get("FLEXKV_ENABLE_CPUTEST", "0") == "1"
 enable_nvcomp = os.environ.get("FLEXKV_ENABLE_NVCOMP", "0") == "1"
 # FLEXKV_ENABLE_METRICS=0: build without Prometheus (no prometheus-cpp dependency)
 enable_metrics = os.environ.get("FLEXKV_ENABLE_METRICS", "0") == "1"
+enable_gdr = os.environ.get("FLEXKV_ENABLE_GDR", "0") == "1"
+gdr_backend = os.environ.get("FLEXKV_GDR_BACKEND", "auto").strip().lower()
+if gdr_backend not in {"auto", "native", "mapped"}:
+    raise ValueError("FLEXKV_GDR_BACKEND must be auto, native, or mapped")
+kernel_default = "0" if enable_gdr and gdr_backend == "mapped" else "1"
+kernel_option = os.environ.get("FLEXKV_ENABLE_KERNEL_TRANSFER", kernel_default)
+if kernel_option not in {"0", "1"}:
+    raise ValueError("FLEXKV_ENABLE_KERNEL_TRANSFER must be 0 or 1")
+enable_kernel_transfer = kernel_option == "1"
+if gdr_backend == "auto":
+    gdr_backend = "native" if enable_kernel_transfer else "mapped"
+if enable_gdr and (sys.platform != "linux" or enable_cputest):
+    raise RuntimeError("FLEXKV_ENABLE_GDR requires a Linux device build")
+if enable_gdr and (gdr_backend == "native") != enable_kernel_transfer:
+    raise ValueError("Select native GDR with kernel transfer or mapped GDR with a host-only build")
+if not enable_kernel_transfer and (enable_gds or enable_nvcomp):
+    raise ValueError("GDS and nvcomp require FLEXKV_ENABLE_KERNEL_TRANSFER=1")
 
 # Define C++ extensions (base: no dist/Redis)
 cpp_sources = [
     "csrc/bindings.cpp",
     "csrc/logging.cpp",
     "csrc/ce_trace.cpp",
-    "csrc/transfer.cu",  # Skip CUDA file for now
+    "csrc/transfer.cu",
     "csrc/ce_transfer.cu",
     "csrc/hash.cpp",
     "csrc/tp_transfer_thread_group.cpp",
@@ -351,8 +368,9 @@ extra_link_args = ["-lcuda", "-lxxhash", "-lpthread", "-lrt", "-luring"]
 if enable_p2p:
     extra_link_args.append("-lhiredis")
 
-if enable_cputest:
+if enable_cputest or not enable_kernel_transfer:
     extra_link_args.remove("-lcuda")
+if enable_cputest and enable_kernel_transfer:
     # Set TORCH_CUDA_ARCH_LIST to avoid IndexError when no GPU is available
     os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;9.0"
 
@@ -363,23 +381,19 @@ if enable_metrics:
 else:
     print("FLEXKV_ENABLE_METRICS=0: building without Prometheus monitoring")
 # Auto-detect GPU architecture if TORCH_CUDA_ARCH_LIST is not explicitly set
-if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
-    os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
-print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
+if enable_kernel_transfer:
+    if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        os.environ["TORCH_CUDA_ARCH_LIST"] = detect_cuda_arch()
+    print(f"TORCH_CUDA_ARCH_LIST = {os.environ['TORCH_CUDA_ARCH_LIST']}")
 
 extra_compile_args = [
     "-O3",
     f'-DFLEXKV_GIT_COMMIT="{build_git_commit}"',
+    f"-DFLEXKV_ENABLE_KERNEL_TRANSFER={int(enable_kernel_transfer)}",
 ]
 if enable_metrics:
     extra_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
-enable_gdr = os.environ.get("FLEXKV_ENABLE_GDR", "0") == "1"
 if enable_gdr:
-    if sys.platform != "linux" or enable_cputest:
-        raise RuntimeError("FLEXKV_ENABLE_GDR requires a Linux device build")
-    gdr_backend = os.environ.get("FLEXKV_GDR_BACKEND", "native")
-    if gdr_backend not in {"native", "mapped"}:
-        raise ValueError("FLEXKV_GDR_BACKEND must be native or mapped")
     cpp_sources.extend(["csrc/gdr/transport.cpp", "csrc/gdr/region_adapter.cpp"])
     hpp_sources.extend(["csrc/gdr/bindings.h", "csrc/gdr/transport.h", "csrc/gdr/region_adapter.h",
                         "csrc/gdr/topology.h"])
@@ -444,6 +458,22 @@ if not enable_gds:
     print("ENABLE_GDS = false: Skipping GDS code")
 if not enable_p2p:
     print("ENABLE_P2P = false: Skipping distributed (P2P/Redis) code; no libhiredis or Redis deps required")
+
+if not enable_kernel_transfer:
+    host_sources = []
+    for source in cpp_sources:
+        if not source.endswith(".cu"):
+            host_sources.append(source)
+            continue
+        path = Path(source)
+        mirror = Path(build_dir) / "host_src" / path.with_suffix(".cu.cpp")
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        text = path.read_text()
+        if not mirror.exists() or mirror.read_text() != text:
+            mirror.write_text(text)
+        host_sources.append(str(mirror))
+        hpp_sources.append(source)
+    cpp_sources = host_sources
 
 cpp_extensions = [
     cpp_extension.CUDAExtension(

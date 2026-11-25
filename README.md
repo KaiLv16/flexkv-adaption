@@ -127,9 +127,18 @@ apt install libhiredis-dev
 See the [SGLang integration guide](flexkv/integration/sglang/README.md).
 
 Local GDR is an opt-in Linux backend for same-host Host↔Device transfers on
-the RegionBatch path. Build with rdma-core development headers and
-`FLEXKV_ENABLE_GDR=1 FLEXKV_GDR_BACKEND=native ./build.sh`. Use
-`FLEXKV_GDR_BACKEND=mapped` when building against the P800 mapped runtime.
+the RegionBatch path. Build with rdma-core development headers and select
+the GPU memory registration interface:
+
+- `FLEXKV_ENABLE_GDR=1 FLEXKV_GDR_BACKEND=native ./build.sh` registers
+  device addresses through GPUDirect RDMA.
+- `FLEXKV_ENABLE_GDR=1 FLEXKV_GDR_BACKEND=mapped ./build.sh` builds the
+  host-only extension and registers device memory through the runtime's
+  host mapping. Set `FLEXKV_ENABLE_CE_ONLY=1` in the serving environment
+  and use a PyTorch allocator configuration that supports CUDA tensor IPC.
+
+`FLEXKV_GDR_BACKEND=auto` selects `native` with kernel transfer enabled
+and `mapped` with `FLEXKV_ENABLE_KERNEL_TRANSFER=0`.
 Set `FLEXKV_LOCAL_GDR=h2d`, `d2h` or `both` in the serving environment.
 The default is `off`. An enabled direction requires a complete local Owner
 registration. `FLEXKV_GDR_NICS` can specify a comma-separated NIC per local

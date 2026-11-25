@@ -24,6 +24,7 @@ from flexkv.common.config import (
     build_layer_member_map,
 )
 from flexkv.common.debug import flexkv_logger
+from flexkv.common.ipc_uuid import ipc_import_device
 from flexkv.common.memory_handle import TensorSharedHandle, release_vmm_tensor
 from flexkv.common.pool import PoolId
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -242,7 +243,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             completion = CompletionContract.from_str(completion)
         # Bind primary GPU before any CUDA IPC import or host registration.
         if gpu_blocks and gpu_blocks[0]:
-            self._ensure_cuda_device(gpu_blocks[0][0].device)
+            self._ensure_cuda_device(ipc_import_device(gpu_blocks[0][0]))
         # Layerwise IDs are staged separately; only whole-op workers consume
         # shared slots. Preserve their registration on the primary GPU before
         # importing IPC handles that may switch the current device.

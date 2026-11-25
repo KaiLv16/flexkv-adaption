@@ -7,6 +7,7 @@
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -21,17 +22,17 @@
 #include <infiniband/verbs.h>
 #include "logging.h"
 
-namespace flexkv::gdr {
+namespace flexkv {
+namespace gdr {
 namespace {
 void require(bool ok, const char *message) {
   if (!ok) throw std::runtime_error(std::string("GDR: ") + message);
 }
 std::string canonical(const std::string &p) {
-  std::error_code ec;
-  auto s=std::filesystem::canonical(p,ec);
-  return ec ? std::string() : s.string();
+  const std::unique_ptr<char, decltype(&std::free)> path(realpath(p.c_str(), nullptr), &std::free);
+  return path ? std::string(path.get()) : std::string();
 }
-struct Mr { void *ptr; size_t bytes; ibv_mr *mr; uintptr_t mapped=0; };
+struct Mr { void *ptr; size_t bytes; ibv_mr *mr; uintptr_t mapped; };
 bool contains(uintptr_t base,size_t size,uintptr_t address,size_t bytes) {
   return address>=base && address-base<=size && bytes<=size-(address-base);
 }
@@ -65,11 +66,11 @@ PageWindow verbs_page_window(void *p,size_t bytes) {
 
 struct Transport::Impl {
   struct Operation {
-    uint64_t sequence = 0;
-    bool read = false;
-    uint32_t bytes = 0;
-    int scratch = -1;
-    uint64_t fence = 0;
+    uint64_t sequence;
+    bool read;
+    uint32_t bytes;
+    int scratch;
+    uint64_t fence;
   };
 
   ibv_context *ctx = nullptr;
@@ -99,7 +100,9 @@ struct Transport::Impl {
   std::array<ibv_sge, kPostBatch> sges{};
   std::vector<Operation> ledger;
   std::array<bool, kMaxFences> scratch_used{};
-  alignas(kScratchStride) std::array<unsigned char, kMaxFences * kScratchStride> scratch{};
+  static constexpr size_t kScratchBytes = kMaxFences * kScratchStride;
+  std::array<unsigned char, kScratchBytes + kScratchStride - 1> scratch_storage{};
+  unsigned char *scratch = nullptr;
   ibv_mr *scratch_mr = nullptr;
   int fence_depth = 0;
   uint64_t posted = 0;
@@ -216,9 +219,11 @@ struct Transport::Impl {
   }
 };
 
+constexpr size_t Transport::Impl::kPostBatch;
+
 Transport::Transport(int device, bool sender, const std::string &nic,
                      const std::string &required_endpoint, int requested_depth,
-                     int requested_fences) : p_(std::make_unique<Impl>()) {
+                     int requested_fences) : p_(new Impl) {
   auto &e = *p_;
   e.sender = sender;
   require(cudaSetDevice(device) == cudaSuccess, "cudaSetDevice failed");
@@ -243,7 +248,7 @@ Transport::Transport(int device, bool sender, const std::string &nic,
   // or the worker received its explicit NIC through the owner handshake.
   if(selected_nic.empty()) {
     require(pci_status==cudaSuccess,
-            "cannot query logical device PCI bus; set gdr.nic_names explicitly");
+            "cannot query logical device PCI bus; set FLEXKV_GDR_NICS explicitly");
     const auto device_path=canonical("/sys/bus/pci/devices/"+bdf);
     require(!bdf.empty() && !device_path.empty(),"logical device PCI path missing from sysfs; cannot auto-select NIC");
     std::vector<std::pair<std::string,std::string>> candidates;
@@ -264,7 +269,7 @@ Transport::Transport(int device, bool sender, const std::string &nic,
     e.ctx=ibv_open_device(raw[i]);e.name=selected_nic;break;
   }
   require(e.ctx && ibv_query_port(e.ctx,1,&e.port)==0 && e.port.state==IBV_PORT_ACTIVE,
-          "selected NIC port 1 is unavailable; check gdr.nic_names and RDMA port state");
+          "selected NIC port 1 is unavailable; check FLEXKV_GDR_NICS and RDMA port state");
   struct Candidate {int priority,index;ibv_gid gid;};
   std::vector<Candidate> candidates;
   if(e.port.link_layer==IBV_LINK_LAYER_ETHERNET) {
@@ -279,7 +284,8 @@ Transport::Transport(int device, bool sender, const std::string &nic,
       const bool local=gid.raw[0]==0xfe && (gid.raw[1]&0xc0)==0x80;
       if(nonzero) candidates.push_back({v2?(local?1:0):2,i,gid});
     }
-    std::stable_sort(candidates.begin(),candidates.end(),[](const auto &a,const auto &b) {return a.priority<b.priority;});
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const Candidate &a, const Candidate &b) { return a.priority < b.priority; });
   } else candidates.push_back({0,0,{}});
   require(!candidates.empty(),"no nonzero RoCE GID with a known v1/v2 type");
 
@@ -305,13 +311,23 @@ Transport::Transport(int device, bool sender, const std::string &nic,
   require(e.cq, "create_cq failed");
   e.ledger.resize(e.depth);
   if (sender && e.fence_depth) {
-    e.scratch_mr = ibv_reg_mr(e.pd, e.scratch.data(), e.scratch.size(), IBV_ACCESS_LOCAL_WRITE);
+    void *scratch = e.scratch_storage.data();
+    size_t space = e.scratch_storage.size();
+    e.scratch = static_cast<unsigned char *>(std::align(
+        Impl::kScratchStride, Impl::kScratchBytes, scratch, space));
+    require(e.scratch, "cannot align read-back scratch storage");
+    e.scratch_mr = ibv_reg_mr(e.pd, e.scratch, Impl::kScratchBytes, IBV_ACCESS_LOCAL_WRITE);
     require(e.scratch_mr, "read-back scratch registration failed");
   }
   for (const auto &candidate : candidates) {
     e.gid_index = candidate.index;
     e.gid = candidate.gid;
-    e.endpoint = bdf + "|" + e.name + "|1|" + std::to_string(e.gid_index) + "|" +
+#ifdef FLEXKV_GDR_MAPPED
+    const char *registration = "mapped";
+#else
+    const char *registration = "native";
+#endif
+    e.endpoint = std::string(registration) + "|" + bdf + "|" + e.name + "|1|" + std::to_string(e.gid_index) + "|" +
                  std::to_string(e.port.active_mtu) + "|" + std::to_string(e.port.lid);
     for (auto byte : e.gid.raw) e.endpoint += "|" + std::to_string(byte);
     if (!required_endpoint.empty() && required_endpoint != e.endpoint) continue;
@@ -377,7 +393,7 @@ void Transport::register_host(void *base, size_t bytes) {
     const auto length = std::min(chunk, bytes);
     auto *mr = ibv_reg_mr(e.pd, ptr, length, IBV_ACCESS_LOCAL_WRITE);
     require(mr, "host MR registration failed; check pinned allocation and memlock");
-    try { e.hosts.push_back({ptr, length, mr}); }
+    try { e.hosts.push_back({ptr, length, mr, 0}); }
     catch (...) { ibv_dereg_mr(mr); throw; }
     bytes -= length;
     ptr += length;
@@ -429,7 +445,7 @@ uint32_t Transport::accept(uint32_t sender) {
 void Transport::release(uint32_t qpn) {
   auto &targets = p_->targets;
   auto target = std::find_if(targets.begin(), targets.end(),
-                             [qpn](auto *qp) { return qp->qp_num == qpn; });
+                             [qpn](const ibv_qp *qp) { return qp->qp_num == qpn; });
   require(target != targets.end(), "unknown target QP");
   require(ibv_destroy_qp(*target) == 0, "destroy target QP failed");
   targets.erase(target);
@@ -444,14 +460,14 @@ void Transport::connect(uint32_t target, std::vector<RemoteRegion> regions) {
             region.bytes <= UINTPTR_MAX - region.local &&
             region.bytes <= UINT64_MAX - region.remote, "invalid owner view");
   }
-  std::sort(e.hosts.begin(), e.hosts.end(), [](const auto &a, const auto &b) {
+  std::sort(e.hosts.begin(), e.hosts.end(), [](const Mr &a, const Mr &b) {
     return reinterpret_cast<uintptr_t>(a.ptr) < reinterpret_cast<uintptr_t>(b.ptr);
   });
   for (size_t i = 1; i < e.hosts.size(); ++i) {
     require(reinterpret_cast<uintptr_t>(e.hosts[i - 1].ptr) + e.hosts[i - 1].bytes <=
             reinterpret_cast<uintptr_t>(e.hosts[i].ptr), "overlapping Host registrations");
   }
-  std::sort(regions.begin(), regions.end(), [](const auto &a, const auto &b) {
+  std::sort(regions.begin(), regions.end(), [](const RemoteRegion &a, const RemoteRegion &b) {
     return a.local < b.local || (a.local == b.local && a.bytes > b.bytes);
   });
   std::vector<RemoteRegion> merged;
@@ -476,7 +492,7 @@ size_t Transport::resolve(uintptr_t host, uintptr_t device, size_t bytes, Span &
   auto host_base = [](const Mr &region) { return reinterpret_cast<uintptr_t>(region.ptr); };
   const auto &hm = e.lookup(e.hosts, e.host_hint, host, host_base);
   const auto &gm = e.lookup(e.remote_regions, e.remote_hint, device,
-                            [](const auto &region) { return region.local; });
+                            [](const RemoteRegion &region) { return region.local; });
   const auto device_offset = device - gm.local;
   const size_t length = std::min({bytes, hm.bytes - (host - host_base(hm)),
       gm.bytes - device_offset, max_payload()});
@@ -528,7 +544,7 @@ bool Transport::post_readback(const Span &last_write, uint64_t fence) {
   const auto free = std::find(e.scratch_used.begin(), e.scratch_used.end(), false);
   const int slot = static_cast<int>(free - e.scratch_used.begin());
   const uint64_t seq = e.posted + 1;
-  e.sges[0] = {reinterpret_cast<uint64_t>(e.scratch.data() + slot * Impl::kScratchStride),
+  e.sges[0] = {reinterpret_cast<uint64_t>(e.scratch + slot * Impl::kScratchStride),
                std::min(last_write.bytes, uint32_t(8)), e.scratch_mr->lkey};
   auto &wr = e.wrs[0];
   wr = {};
@@ -601,4 +617,5 @@ void Transport::make_device_visible(int device) {
   throw std::runtime_error("GDR native H2D requires CUDA >= 11.3");
 #endif
 }
-}  // namespace flexkv::gdr
+}  // namespace gdr
+}  // namespace flexkv

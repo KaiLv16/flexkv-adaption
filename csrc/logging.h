@@ -1,6 +1,7 @@
 #pragma once
 
-namespace flexkv::logging {
+namespace flexkv {
+namespace logging {
 
 enum class Level {
   Debug,
@@ -14,7 +15,8 @@ bool IsEnabled(Level level) noexcept;
 void Logf(Level level, const char *file, int line, const char *format,
           ...) noexcept;
 
-} // namespace flexkv::logging
+} // namespace logging
+} // namespace flexkv
 
 #define FLEXKV_LOG_IMPL(level, ...)                                          \
   do {                                                                       \

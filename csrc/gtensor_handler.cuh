@@ -2,6 +2,12 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#ifdef __CUDACC__
+#define FLEXKV_HOST_DEVICE __host__ __device__
+#else
+#define FLEXKV_HOST_DEVICE
+#endif
+
 namespace flexkv {
 
 // Backend type enumeration
@@ -16,11 +22,11 @@ struct GTensorHandler {
   int64_t gpu_block_stride;
   int64_t gpu_layer_stride;
 
-  __host__ __device__ GTensorHandler()
+  FLEXKV_HOST_DEVICE GTensorHandler()
       : type(BackendType::VLLM), gpu_tensor_ptrs(nullptr), num_layers(0),
         gpu_kv_stride(0), gpu_block_stride(0), gpu_layer_stride(0) {}
 
-  __host__ __device__ GTensorHandler(BackendType type,
+  FLEXKV_HOST_DEVICE GTensorHandler(BackendType type,
                                      int64_t **gpu_tensor_ptrs,
                                      int64_t num_layers,
                                      int64_t gpu_kv_stride_in_bytes,
@@ -35,13 +41,13 @@ struct GTensorHandler {
 // Template specialization for different backends
 // Forward declaration
 template <BackendType Type>
-__device__ __host__ inline int64_t *ptr_at(const GTensorHandler &handler,
+FLEXKV_HOST_DEVICE inline int64_t *ptr_at(const GTensorHandler &handler,
                                            int64_t layer_idx, int64_t kv_idx,
                                            int64_t block_idx);
 
 // vLLM specialization
 template <>
-__device__ __host__ inline int64_t *
+FLEXKV_HOST_DEVICE inline int64_t *
 ptr_at<BackendType::VLLM>(const GTensorHandler &handler, int64_t layer_idx,
                           int64_t kv_idx, int64_t block_idx) {
   return handler.gpu_tensor_ptrs[layer_idx] + kv_idx * handler.gpu_kv_stride +
@@ -50,7 +56,7 @@ ptr_at<BackendType::VLLM>(const GTensorHandler &handler, int64_t layer_idx,
 
 // TRT-LLM specialization
 template <>
-__device__ __host__ inline int64_t *
+FLEXKV_HOST_DEVICE inline int64_t *
 ptr_at<BackendType::TRTLLM>(const GTensorHandler &handler, int64_t layer_idx,
                             int64_t kv_idx, int64_t block_idx) {
   return handler.gpu_tensor_ptrs[0] + block_idx * handler.gpu_block_stride +
@@ -59,7 +65,7 @@ ptr_at<BackendType::TRTLLM>(const GTensorHandler &handler, int64_t layer_idx,
 
 // SGLang specialization
 template <>
-__device__ __host__ inline int64_t *
+FLEXKV_HOST_DEVICE inline int64_t *
 ptr_at<BackendType::SGLANG>(const GTensorHandler &handler, int64_t layer_idx,
                             int64_t kv_idx, int64_t block_idx) {
   return handler.gpu_tensor_ptrs[kv_idx * handler.num_layers + layer_idx] +
@@ -67,3 +73,5 @@ ptr_at<BackendType::SGLANG>(const GTensorHandler &handler, int64_t layer_idx,
 }
 
 } // namespace flexkv
+
+#undef FLEXKV_HOST_DEVICE

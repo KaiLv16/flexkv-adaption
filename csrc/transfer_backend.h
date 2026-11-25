@@ -45,7 +45,8 @@ template <BackendType K>
 using TensorKindTag = std::integral_constant<BackendType, K>;
 
 template <typename F>
-auto with_tensor_kind(BackendType kind, F &&fn) {
+auto with_tensor_kind(BackendType kind, F &&fn)
+    -> decltype(fn(TensorKindTag<BackendType::VLLM>{})) {
   switch (kind) {
   case BackendType::VLLM:
     return fn(TensorKindTag<BackendType::VLLM>{});

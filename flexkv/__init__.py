@@ -3,6 +3,8 @@ import glob
 import os
 import sys
 
+from flexkv.common.ce_only import apply_ce_only_settings
+
 
 # Add package lib directory to system library path
 def _setup_library_path() -> None:
@@ -41,6 +43,7 @@ def _setup_library_path() -> None:
 
 
 # Call the setup function when the package is imported
+apply_ce_only_settings()
 _setup_library_path()
 
 # ``flexkv.c_ext`` is a PyTorch C++ extension and dynamically links against

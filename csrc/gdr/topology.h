@@ -1,20 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
-#include <filesystem>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
-namespace flexkv::gdr {
+namespace flexkv {
+namespace gdr {
+inline std::vector<std::string> path_components(const std::string &path) {
+  std::vector<std::string> components;
+  std::istringstream input(path);
+  for (std::string component; std::getline(input, component, '/');) {
+    if (!component.empty()) components.push_back(component);
+  }
+  return components;
+}
+
 // Inputs are canonical sysfs paths, not BDF numbers or enumeration indices.
 // Prefer the deepest common ancestor, then the fewest PCIe path hops.
 inline std::pair<int,int> pci_proximity(const std::string &device,
                                        const std::string &nic) {
   if(device.empty() || nic.empty()) return {-1,0};
-  std::vector<std::string> a,b;
-  for(const auto &p:std::filesystem::path(device)) a.push_back(p.string());
-  for(const auto &p:std::filesystem::path(nic)) b.push_back(p.string());
+  const auto a = path_components(device);
+  const auto b = path_components(nic);
   size_t common=0;bool shared_pci_root=false;
   while(common<a.size() && common<b.size() && a[common]==b[common]) {
     if(a[common].rfind("pci",0)==0) shared_pci_root=true;
@@ -38,8 +47,9 @@ inline size_t select_local_nic(const std::string &device,
     message+=tied?"ambiguous nearest NIC":"no active NIC with a shared PCI root";
     message+=" for device path="+device+"; candidates:";
     for(const auto &n:nics) message+=" "+n.first+"="+n.second;
-    throw std::runtime_error(message+"; check sysfs visibility or set gdr.nic_names explicitly");
+    throw std::runtime_error(message+"; check sysfs visibility or set FLEXKV_GDR_NICS explicitly");
   }
   return selected;
 }
-} // namespace flexkv::gdr
+} // namespace gdr
+} // namespace flexkv

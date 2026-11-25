@@ -88,8 +88,13 @@ def import_tensor_handles(
     """
     imported = []
     for handle in handles:
-        ensure_cuda_device(handle.device, cuda_device_ids=cuda_device_ids)
-        imported.append(handle.get_tensor())
+        if getattr(handle, "ipc_device_uuid", None) is not None:
+            tensor = handle.get_tensor()
+            ensure_cuda_device(tensor.device, cuda_device_ids=cuda_device_ids)
+        else:
+            ensure_cuda_device(handle.device, cuda_device_ids=cuda_device_ids)
+            tensor = handle.get_tensor()
+        imported.append(tensor)
     return imported
 
 

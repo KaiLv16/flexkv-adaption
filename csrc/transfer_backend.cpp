@@ -98,6 +98,11 @@ const TransferBackend &get_backend(TransferBackendKind kind) {
 
 TransferBackendKind resolve_backend(TransferBackendKind requested,
                                     bool use_ce_transfer) {
+#if !FLEXKV_ENABLE_KERNEL_TRANSFER
+  if (requested == TransferBackendKind::AUTO) return TransferBackendKind::COPY_ENGINE;
+  if (requested == TransferBackendKind::SM_KERNEL)
+    throw std::invalid_argument("Kernel transfer was not compiled");
+#endif
   if (requested != TransferBackendKind::AUTO) {
     return requested;
   }

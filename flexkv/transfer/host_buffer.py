@@ -11,6 +11,7 @@ from typing import Optional, List
 import numpy as np
 import torch
 
+from flexkv.common.ce_only import ce_only_enabled
 from flexkv.common.debug import flexkv_logger
 from flexkv.storage.allocator import (
     alloc_hugepage_tensor,
@@ -86,7 +87,7 @@ def cudaHostRegister(tensor: torch.Tensor) -> None:
     cudart = _get_cudart()
     ptr_base = tensor.data_ptr()
     total_size = tensor.numel() * tensor.element_size()
-    flags = CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED
+    flags = 0 if ce_only_enabled() else CUDA_HOST_REGISTER_PORTABLE | CUDA_HOST_REGISTER_MAPPED
     chunk_size = _get_cudahost_chunk_bytes()
     api = _host_region_api()
     if chunk_size and api is None and any(
@@ -240,6 +241,10 @@ def alloc_mapped_host_tensor(num_elements: int, dtype: torch.dtype) -> torch.Ten
 
 
 def _allocate_pinned_cpu_tensor(num_elements: int, dtype: torch.dtype) -> HostBufferHandle:
+    if ce_only_enabled():
+        return HostBufferHandle.pinned(
+            torch.empty(num_elements, dtype=dtype, device="cpu", pin_memory=True)
+        )
     return HostBufferHandle.pinned(alloc_mapped_host_tensor(num_elements, dtype))
 
 

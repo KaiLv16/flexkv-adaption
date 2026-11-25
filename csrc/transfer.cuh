@@ -16,6 +16,10 @@
  */
 #pragma once
 
+#ifndef FLEXKV_ENABLE_KERNEL_TRANSFER
+#define FLEXKV_ENABLE_KERNEL_TRANSFER 1
+#endif
+
 #include "ce_transfer.h"
 #include "gtensor_handler.cuh"
 #include <cuda_runtime.h>

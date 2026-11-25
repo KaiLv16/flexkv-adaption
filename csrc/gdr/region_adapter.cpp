@@ -14,11 +14,23 @@
 #include <thread>
 #include <unistd.h>
 
-namespace flexkv::gdr {
+namespace flexkv {
+namespace gdr {
 namespace {
 
 constexpr size_t kWindow = 16;
 constexpr auto kNoProgressTimeout = std::chrono::seconds(30);
+
+struct BlockAddress {
+  const GTensorHandler &handler;
+  int layer;
+  int kv;
+
+  template <BackendType Type>
+  uintptr_t operator()(TensorKindTag<Type>) const {
+    return reinterpret_cast<uintptr_t>(ptr_at<Type>(handler, layer, kv, 0));
+  }
+};
 
 // A prepared region owns no memory. RegionBatch keeps the torch objects
 // alive until the combined executors return, including the error path.
@@ -50,9 +62,7 @@ public:
     host = add(host, layer, a.cpu_layer_stride_in_bytes);
     host = add(host, kv_, a.cpu_kv_stride_in_bytes);
     host = add(host, 1, a.cpu_startoff_inside_chunks);
-    auto device = with_tensor_kind(a.tensor_kind, [&](auto kind) {
-      return reinterpret_cast<uintptr_t>(ptr_at<decltype(kind)::value>(gpu, layer, kv_, 0));
-    });
+    auto device = with_tensor_kind(a.tensor_kind, BlockAddress{gpu, layer, kv_});
     if (!device) throw std::invalid_argument("GDR: missing device backing");
     device = add(device, device_block, a.gpu_block_stride_in_bytes);
     device = add(device, 1, a.gpu_startoff_inside_chunks);
@@ -86,11 +96,11 @@ private:
 };
 
 struct Checkpoint {
-  uint64_t sequence = 0;
-  uint64_t fence = 0;
-  int milestone = -1;
-  bool needs_visibility = false;
-  bool sent = false;
+  uint64_t sequence;
+  uint64_t fence;
+  int milestone;
+  bool needs_visibility;
+  bool sent;
 };
 
 bool send_command(int fd, char command) {
@@ -234,7 +244,7 @@ RegionAdapter::~RegionAdapter() = default;
 void RegionAdapter::install(int rank, std::unique_ptr<Transport> sender, int control_fd) {
   auto &route = routes_.at(rank);
   if (route) throw std::logic_error("GDR route already installed");
-  auto candidate = std::make_unique<Route>();
+  std::unique_ptr<Route> candidate(new Route);
   candidate->control_fd = fcntl(control_fd, F_DUPFD_CLOEXEC, 0);
   if (candidate->control_fd < 0) throw std::runtime_error("GDR: cannot retain Owner channel");
   candidate->sender = std::move(sender);
@@ -243,7 +253,7 @@ void RegionAdapter::install(int rank, std::unique_ptr<Transport> sender, int con
 
 bool RegionAdapter::ready() const {
   return !unsafe_ && std::all_of(routes_.begin(), routes_.end(),
-                                [](const auto &route) { return bool(route); });
+                                [](const std::unique_ptr<Route> &route) { return bool(route); });
 }
 
 void RegionAdapter::run(DeviceThreadPool &threads,
@@ -296,13 +306,11 @@ std::vector<Stats> RegionAdapter::statistics() const {
   return stats;
 }
 
-}  // namespace flexkv::gdr
-
-namespace flexkv {
+}  // namespace gdr
 
 void RegionBatchGroup::install_gdr_route(int rank, std::unique_ptr<gdr::Transport> sender,
                                          int fd) {
-  if (!gdr_) gdr_ = std::make_unique<gdr::RegionAdapter>(num_gpus());
+  if (!gdr_) gdr_.reset(new gdr::RegionAdapter(num_gpus()));
   gdr_->install(rank, std::move(sender), fd);
 }
 
@@ -349,7 +357,7 @@ bool RegionBatchGroup::try_gdr(const std::vector<RegionRequest> &requests,
     order.push_back(&request);
   }
   if (empty_layers) {
-    std::stable_sort(order.begin(), order.end(), [](auto *a, auto *b) {
+    std::stable_sort(order.begin(), order.end(), [](const RegionRequest *a, const RegionRequest *b) {
       return a->milestone_layer < b->milestone_layer;
     });
   }

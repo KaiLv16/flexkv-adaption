@@ -8,7 +8,8 @@
 #include <string>
 #include <vector>
 
-namespace flexkv::gdr {
+namespace flexkv {
+namespace gdr {
 
 struct Span {
   uint64_t host;
@@ -76,4 +77,5 @@ private:
   std::unique_ptr<Impl> p_;
 };
 
-}  // namespace flexkv::gdr
+}  // namespace gdr
+}  // namespace flexkv
