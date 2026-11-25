@@ -742,9 +742,10 @@ def run_arm(exp, split, backend, g, arm_dir):
     arm_dir.mkdir()
     with tempfile.TemporaryDirectory(prefix="kv-transfer-", dir="/tmp") as directory:
         scratch = Path(directory)
-        (scratch / "config.json").write_text(json.dumps({"cpu_cache_gb": exp.host_cache_gib,
-                                                         "ssd_cache_gb": 0,
-                                                         "remote_cache_gb": 0}))
+        (scratch / "config.json").write_text(json.dumps({
+            "cpu_cache_gb": exp.host_cache_gib,
+            "ssd_cache_gb": 0,
+        }))
         env = arm_env(exp, backend, scratch)
         command = [sys.executable, str(Path(__file__).resolve()), "--run-arm", exp.name,
                    backend, str(int(split)), str(arm_dir), str(scratch / "gloo")]
