@@ -188,8 +188,9 @@ struct Transport::Impl {
     ibv_qp_attr a{};a.qp_state=IBV_QPS_RTR;a.path_mtu=port.active_mtu;a.dest_qp_num=peer;
     a.max_dest_rd_atomic=read_depth;a.min_rnr_timer=12;a.ah_attr.port_num=port_num;
     if(port.link_layer==IBV_LINK_LAYER_ETHERNET) {
+      // Both QPs use this port and GID. The GRH describes a local peer.
       a.ah_attr.is_global=1;a.ah_attr.grh.dgid=gid;
-      a.ah_attr.grh.sgid_index=gid_index;a.ah_attr.grh.hop_limit=64;
+      a.ah_attr.grh.sgid_index=gid_index;a.ah_attr.grh.hop_limit=1;
     } else a.ah_attr.dlid=port.lid;
     modify(q,a,IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|IBV_QP_DEST_QPN|IBV_QP_RQ_PSN|IBV_QP_MAX_DEST_RD_ATOMIC|IBV_QP_MIN_RNR_TIMER,"RTR");
     a={};a.qp_state=IBV_QPS_RTS;a.timeout=14;a.retry_cnt=7;a.rnr_retry=7;a.max_rd_atomic=read_depth;
