@@ -163,26 +163,38 @@ class LocalGdrLeaseTest(unittest.TestCase):
         self.assertEqual(order, ["QP closed", b"D", "fd closed"])
 
 
+@unittest.skipUnless(sys.platform == "linux" and importlib.util.find_spec("torch"),
+                     "requires a FlexKV runtime on Linux")
 class LocalGdrIncidentTest(unittest.TestCase):
-    @unittest.skipUnless(sys.platform == "linux" and importlib.util.find_spec("torch"),
-                         "requires a FlexKV runtime on Linux")
-    def test_pending_dma_reports_session_fault_across_process_pipe(self):
+    def setUp(self):
         try:
             from flexkv import c_ext  # noqa: F401
         except ImportError:
             self.skipTest("requires a built FlexKV extension")
-        from flexkv.transfer.local_gdr import LocalGdrQuarantined
         from flexkv.transfer_manager import TransferManagerInterProcessHandle
 
-        handle = TransferManagerInterProcessHandle(
+        self.handle = TransferManagerInterProcessHandle(
             types.SimpleNamespace(tp_size=1, dp_size=1), types.SimpleNamespace(), "/tmp/unused"
         )
-        self.addCleanup(handle.shutdown)
-        handle.error_child_conn.send(LocalGdrQuarantined("uncertain RDMA drain"))
+        self.addCleanup(self.handle.shutdown)
+
+    def test_worker_can_spawn_with_parent_health_lock(self):
+        # The incomplete config makes the child fail before allocating any KV.
+        self.handle._start_process()
+        self.assertTrue(self.handle.start_event.wait(timeout=15))
+        self.assertTrue(self.handle.error_parent_conn.poll(timeout=15))
+        self.assertIn("instance_num", self.handle.error_parent_conn.recv())
+        self.handle.process.join(timeout=5)
+        self.assertEqual(self.handle.process.exitcode, 1)
+
+    def test_pending_dma_reports_session_fault_across_process_pipe(self):
+        from flexkv.transfer.local_gdr import LocalGdrQuarantined
+
+        self.handle.error_child_conn.send(LocalGdrQuarantined("uncertain RDMA drain"))
         with self.assertRaisesRegex(LocalGdrQuarantined, "uncertain RDMA drain"):
-            handle.wait(timeout=0)
+            self.handle.wait(timeout=0)
         with self.assertRaisesRegex(LocalGdrQuarantined, "uncertain RDMA drain"):
-            handle.submit_batch([])
+            self.handle.submit_batch([])
 
 
 if __name__ == "__main__":

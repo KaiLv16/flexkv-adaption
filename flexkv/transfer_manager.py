@@ -1097,8 +1097,9 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         self.error_child_conn.close()
         flexkv_logger.debug(f"TransferManager subprocess spawned, pid={self.process.pid}")
 
-    def _process_worker(self,
-                        model_config: ModelConfig,
+    # A bound target would make spawn pickle the parent handle and its lock.
+    @staticmethod
+    def _process_worker(model_config: ModelConfig,
                         cache_config: CacheConfig,
                         command_conn,
                         result_conn,
