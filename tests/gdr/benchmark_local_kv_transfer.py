@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import gc
 import itertools
 import json
 import os
@@ -604,13 +605,34 @@ def run_rank(rank, exp, split, backend, g, arena_pages, rendezvous, arm_dir):
             raise VerificationError(f"{phase}: layerwise verification failed: {outcomes}")
 
     def shutdown_drained():
+        nonlocal connector, manager, observer, owner, pool
         dist.barrier()
-        # Stop both Worker directions before followers can drop their GPU MRs.
-        if rank == 0:
-            connector.shutdown()
+        # Join the IPC importers before any rank retires its exported buffers.
+        if manager is not None:
+            manager.shutdown()
+            connector.kv_manager = None
         dist.barrier()
-        if rank != 0:
-            connector.shutdown()
+        connector.shutdown()
+        if owner is not None:
+            deadline = time.monotonic() + TIMEOUT_S
+            while True:
+                owner.check_healthy()
+                with owner.lock:
+                    if owner.endpoint is None:
+                        break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"rank={rank}: GDR owner did not retire")
+                time.sleep(POLL_INTERVAL_S)
+
+        # Collect the exported storage while the CUDA runtime is still live.
+        print(f"{PROGRESS_MARKER} rank={rank} collecting CUDA IPC allocations", flush=True)
+        torch.cuda.synchronize(rank)
+        del connector, manager, observer, owner, pool
+        gc.collect()
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
+        print(f"{PROGRESS_MARKER} rank={rank} CUDA IPC cleanup complete", flush=True)
+        dist.barrier()
 
     # Only the leader writes round records. Keep completed rows on disk if a
     # later case fails. The resident Host/GPU pools are reused for each arm.
