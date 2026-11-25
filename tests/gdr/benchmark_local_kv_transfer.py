@@ -5,7 +5,8 @@
 
 Each experiment starts real FlexKV Connectors, a TransferManager and workers.
 A synthetic KV pool and local Gloo groups replace the model and its runtime.
-See EXPERIMENTS below. Full verification is outside the performance samples.
+See EXPERIMENTS below. Byte verification uses CPU readback outside the
+performance samples. See test_local_gdr_visibility.py for kernel visibility.
 """
 
 from __future__ import annotations
@@ -273,9 +274,21 @@ def round_slots(torch, np, exp, tokens, count, epoch, arena_pages):
     return result
 
 
-def pattern(np, width, count, start, layer, name, generation, dtype):
+def page_runs(np, page_ids):
+    # Sort physical pages for contiguous copies while keeping their positions
+    # in the original request order for pattern generation.
+    order = np.argsort(page_ids)
+    physical = page_ids[order]
+    boundaries = np.flatnonzero(np.diff(physical) != 1) + 1
+    for run in np.split(order, boundaries):
+        for begin in range(0, len(run), VERIFY_CHUNK_PAGES):
+            positions = run[begin:begin + VERIFY_CHUNK_PAGES]
+            yield int(page_ids[positions[0]]), positions
+
+
+def pattern(np, width, positions, layer, name, generation, dtype):
     # Distinguish page order, layer, region, byte offset and overwritten generation.
-    rows = np.arange(start, start + count, dtype=np.int64)[:, None]
+    rows = positions[:, None]
     cols = np.arange(width, dtype=np.int64)[None, :]
     return ((rows * 31 + (rows // 127) * (cols % 37 + 1)
              + cols * 17 + (cols >> 7) + layer * 13 + generation * 23
@@ -283,39 +296,39 @@ def pattern(np, width, count, start, layer, name, generation, dtype):
 
 
 def touch_pages(torch, np, pool, page_ids, generation, *, prepare=False, poison=False, layer=None):
+    runs = list(page_runs(np, page_ids))
     layers = range(pool.layer_num) if layer is None else (layer,)
     tensors = [(layer, name, buf) for layer in layers for name, buf in pool.rows(layer)]
     if poison:
         tensors.extend((-1, "scratch", buf) for buf in pool.scratch_rows())
     for lid, name, buf in tensors:
-        for begin in range(0, len(page_ids), VERIFY_CHUNK_PAGES):
-            pages = page_ids[begin:begin + VERIFY_CHUNK_PAGES]
-            ids = torch.as_tensor(pages, device=buf.device)
+        dtype = np.int8 if buf.dtype == torch.int8 else np.uint8
+        for first, positions in runs:
+            rows = buf[first:first + len(positions)]
             if poison:
-                buf.index_fill_(0, ids, 127)
+                rows.copy_(torch.from_numpy(np.full(rows.shape, 127, dtype=dtype)))
                 continue
-            dtype = np.int8 if buf.dtype == torch.int8 else np.uint8
-            expected = pattern(np, buf.shape[1], len(pages), begin, lid, name, generation, dtype)
+            expected = pattern(np, buf.shape[1], positions, lid, name, generation, dtype)
             if prepare:
-                buf.index_copy_(0, ids, torch.from_numpy(expected).to(buf.device))
+                rows.copy_(torch.from_numpy(expected))
             else:
-                observed = buf.index_select(0, ids).cpu().numpy()
+                observed = rows.cpu().numpy()
                 if not np.array_equal(observed, expected):
                     page_row, col = np.argwhere(observed != expected)[0]
                     raise AssertionError(
-                        f"rank={pool.rank} layer={lid} region={name} page={pages[page_row]} "
+                        f"rank={pool.rank} layer={lid} region={name} page={first + page_row} "
                         f"byte={col} found={observed[page_row, col]} expected={expected[page_row, col]}")
 
 
-def check_untouched(torch, pool, pages):
+def check_untouched(np, pool, pages):
     for layer in range(pool.layer_num):
         for name, rows in pool.rows(layer):
-            if not bool((rows[0] == 127).all().item()):
+            if not np.all(rows[0].cpu().numpy() == 127):
                 raise AssertionError(f"rank={pool.rank} layer={layer} {name} touched guard page")
+    runs = list(page_runs(np, pages))
     for rows in pool.scratch_rows():
-        ix = torch.as_tensor(pages, device=rows.device)
-        for chunk in ix.split(VERIFY_CHUNK_PAGES):
-            if not bool((rows.index_select(0, chunk) == 127).all().item()):
+        for first, positions in runs:
+            if not np.all(rows[first:first + len(positions)].cpu().numpy() == 127):
                 raise AssertionError(f"rank={pool.rank} transfer touched receive scratch")
 
 
@@ -582,7 +595,7 @@ def run_rank(rank, exp, split, backend, g, arena_pages, rendezvous, arm_dir):
         try:
             require_empty_eventfds(event)
             if verify and not errors:
-                check_untouched(torch, pool, pages)
+                check_untouched(np, pool, pages)
         except (RuntimeError, AssertionError) as exc:
             errors.append(str(exc))
         outcomes = [None] * ranks
