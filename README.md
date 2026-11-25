@@ -163,7 +163,7 @@ test using the serving GPU runtime and the selected NIC:
 ```bash
 FLEXKV_LOCAL_GDR=h2d FLEXKV_ENABLE_CE_ONLY=1 \
   FLEXKV_GDR_EXPERIMENTAL_MAPPED_H2D=1 FLEXKV_RUN_GDR_VISIBILITY_TEST=1 \
-  python -m unittest discover -s tests -p test_local_gdr_visibility.py -v
+  python -m unittest discover -s tests/gdr -p test_local_gdr_visibility.py -v
 ```
 
 This backend needs platform acceptance before production use. Verify the

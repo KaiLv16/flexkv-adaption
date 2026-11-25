@@ -45,7 +45,7 @@ class CeOnlyIpcTest(unittest.TestCase):
         torch_mp = types.ModuleType("torch.multiprocessing")
         torch_mp.reductions = self.reductions
         package = types.ModuleType("flexkv")
-        package.__path__ = [str(Path(__file__).resolve().parents[1] / "flexkv")]
+        package.__path__ = [str(Path(__file__).resolve().parents[2] / "flexkv")]
         debug = types.ModuleType("flexkv.common.debug")
         debug.flexkv_logger = Mock()
         modules = {

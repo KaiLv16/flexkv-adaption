@@ -12,7 +12,7 @@ class LocalGdrTransportTest(unittest.TestCase):
         compiler = shutil.which("c++")
         if compiler is None:
             self.skipTest("C++ compiler required")
-        fixture = Path(__file__).resolve().parent / "gdr"
+        fixture = Path(__file__).resolve().parent
         csrc = fixture.parents[1] / "csrc"
         with tempfile.TemporaryDirectory() as temp:
             for backend in ("native", "mapped"):

@@ -1,7 +1,7 @@
 """Standalone FlexKV transfer benchmark for a specific model's KV layout.
 
-    python tests/benchmark_local_kv_transfer.py --plan
-    python tests/benchmark_local_kv_transfer.py --output /path/to/new/result_dir
+    python tests/gdr/benchmark_local_kv_transfer.py --plan
+    python tests/gdr/benchmark_local_kv_transfer.py --output /path/to/new/result_dir
 
 Each experiment starts real FlexKV Connectors, a TransferManager and workers.
 A synthetic KV pool and local Gloo groups replace the model and its runtime.
@@ -93,7 +93,7 @@ TIMEOUT_S = 240
 POLL_INTERVAL_S = 0.001
 VERIFY_CHUNK_PAGES = 16
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 COUNTERS_MARKER = "per-QP payload WRs): "
 PROGRESS_MARKER = "[KV-TRANSFER-BENCH]"
 

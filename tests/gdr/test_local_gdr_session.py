@@ -1,4 +1,4 @@
-"""CPU-only regressions for the local GDR Owner lease protocol."""
+"""Regressions for local GDR Owner leases and fault propagation."""
 
 import importlib.util
 import os
@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location(
     "local_gdr",
-    Path(__file__).resolve().parents[1] / "flexkv" / "transfer" / "local_gdr.py",
+    Path(__file__).resolve().parents[2] / "flexkv" / "transfer" / "local_gdr.py",
 )
 local_gdr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(local_gdr)
@@ -161,6 +161,28 @@ class LocalGdrLeaseTest(unittest.TestCase):
         group = types.SimpleNamespace(close_gdr=lambda: order.append("QP closed"))
         local_gdr.close_routes(group, [Lease()])
         self.assertEqual(order, ["QP closed", b"D", "fd closed"])
+
+
+class LocalGdrIncidentTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux" and importlib.util.find_spec("torch"),
+                         "requires a FlexKV runtime on Linux")
+    def test_pending_dma_reports_session_fault_across_process_pipe(self):
+        try:
+            from flexkv import c_ext  # noqa: F401
+        except ImportError:
+            self.skipTest("requires a built FlexKV extension")
+        from flexkv.transfer.local_gdr import LocalGdrQuarantined
+        from flexkv.transfer_manager import TransferManagerInterProcessHandle
+
+        handle = TransferManagerInterProcessHandle(
+            types.SimpleNamespace(tp_size=1, dp_size=1), types.SimpleNamespace(), "/tmp/unused"
+        )
+        self.addCleanup(handle.shutdown)
+        handle.error_child_conn.send(LocalGdrQuarantined("uncertain RDMA drain"))
+        with self.assertRaisesRegex(LocalGdrQuarantined, "uncertain RDMA drain"):
+            handle.wait(timeout=0)
+        with self.assertRaisesRegex(LocalGdrQuarantined, "uncertain RDMA drain"):
+            handle.submit_batch([])
 
 
 if __name__ == "__main__":
