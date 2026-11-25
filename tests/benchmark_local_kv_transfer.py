@@ -1,7 +1,7 @@
-"""Standalone HY4-shaped FlexKV benchmark. Run from the built FlexKV checkout.
+"""Standalone FlexKV transfer benchmark for a specific model's KV layout.
 
-    python tests/benchmark_hy4_local_gdr.py --plan
-    python tests/benchmark_hy4_local_gdr.py --output /path/to/new/result_dir
+    python tests/benchmark_local_kv_transfer.py --plan
+    python tests/benchmark_local_kv_transfer.py --output /path/to/new/result_dir
 
 Each experiment starts real FlexKV Connectors, a TransferManager and workers.
 A synthetic KV pool and local Gloo groups replace the model and its runtime.
@@ -54,7 +54,7 @@ class Experiment:
 # runtime and opts the benchmark into experimental mapped H2D.
 EXPERIMENTS = (
     Experiment(
-        name="hy4-cp8-mapped",
+        name="cp8-mapped",
         gpu_count=8, runtime="mapped", layer_split=(False, True),
         backends=("ce", "gdr"), qp_count=4, host_cache_gib=4,
         h2d_tokens=(1024, 4096), h2d_requests=(1, 4),
@@ -62,7 +62,7 @@ EXPERIMENTS = (
         warmups=2, rounds=5,
     ),
     # Experiment(
-    #     name="hy4-cp2-native-smoke",
+    #     name="cp2-native-smoke",
     #     gpu_count=2, runtime="native", layer_split=(False, True),
     #     backends=("ce", "gdr"), qp_count=1, host_cache_gib=1,
     #     h2d_tokens=(128, 512), h2d_requests=(1, 3),
@@ -70,7 +70,7 @@ EXPERIMENTS = (
     #     warmups=1, rounds=2,
     # ),
     # Experiment(
-    #     name="hy4-cp8-large-batches",
+    #     name="cp8-large-batches",
     #     gpu_count=8, runtime="mapped", layer_split=(True,),
     #     backends=("ce", "gdr"), qp_count=4, host_cache_gib=32,
     #     h2d_tokens=(8192, 32768), h2d_requests=(2, 8),
@@ -79,10 +79,9 @@ EXPERIMENTS = (
     # ),
 )
 
-# HY4 v21 target KV profile. Supply its config.json (absolute or relative to
-# the repo root) for the exact mask and dimensions. The default mask follows
-# the HY4 configuration class.
-HY4_CONFIG_JSON = None
+# Default KV layout for a specific model. Supply its config.json (absolute
+# or relative to the repo root) for the exact indexer mask and dimensions.
+MODEL_CONFIG_JSON = None
 PAGE_SIZE = 128
 NUM_LAYERS = 78
 KV_LORA_RANK = 512
@@ -96,6 +95,7 @@ VERIFY_CHUNK_PAGES = 16
 
 ROOT = Path(__file__).resolve().parents[1]
 COUNTERS_MARKER = "per-QP payload WRs): "
+PROGRESS_MARKER = "[KV-TRANSFER-BENCH]"
 
 
 @dataclass(frozen=True)
@@ -121,8 +121,8 @@ class Geometry:
 
 def geometry():
     cfg = {}
-    if HY4_CONFIG_JSON:
-        cfg = json.loads((ROOT / HY4_CONFIG_JSON).read_text())
+    if MODEL_CONFIG_JSON:
+        cfg = json.loads((ROOT / MODEL_CONFIG_JSON).read_text())
         cfg = cfg.get("text_config", cfg)
     layers = int(cfg.get("num_hidden_layers", NUM_LAYERS))
     kinds = cfg.get("indexer_types")
@@ -130,7 +130,7 @@ def geometry():
         active = tuple(i for i in range(layers) if i == 0 or (i - 1) % 4 == 0)
     else:
         if len(kinds) != layers or set(kinds) - {"full", "shared"} or kinds[0] != "full":
-            raise ValueError("Unexpected HY4 indexer_types")
+            raise ValueError("Unexpected model indexer_types")
         active = tuple(i for i, kind in enumerate(kinds) if kind == "full")
     g = Geometry(layers, int(cfg.get("kv_lora_rank", KV_LORA_RANK)),
                  int(cfg.get("qk_rope_head_dim", ROPE_DIM)),
@@ -138,7 +138,7 @@ def geometry():
     if (g.layers <= 0 or g.lora <= 0 or g.lora % 128 or g.rope <= 0
             or g.index_dim <= 0 or g.index_dim % 128 or not active
             or PAGE_SIZE * g.kv_width % 8 or PAGE_SIZE * g.index_width % 8):
-        raise ValueError(f"Invalid HY4 geometry: {g}")
+        raise ValueError(f"Invalid model KV geometry: {g}")
     return g
 
 
@@ -187,7 +187,7 @@ def payload_by_rank(g, split, ranks, direction, pages):
 
 
 class SyntheticPool:
-    """Minimal HY4 GPU pool adapter consumed by the real Connector."""
+    """Synthetic GPU pool for the configured model layout."""
 
     def __init__(self, torch, rank, ranks, split, g, pages):
         self.torch = torch
@@ -477,7 +477,7 @@ def capture_round(dist, rank, ranks, output, g, split, direction, tokens, count,
     output.write(json.dumps(data) + "\n")
     output.flush()
     if phase == "measure":
-        print(f"[HY4-BENCH] {direction} tokens={tokens} requests={count} round={iteration + 1} "
+        print(f"{PROGRESS_MARKER} {direction} tokens={tokens} requests={count} round={iteration + 1} "
               f"time={data['elapsed_ms']:.3f} ms payload={data['payload_gib_s']:.3f} GiB/s", flush=True)
 
 
@@ -505,7 +505,7 @@ def run_rank(rank, exp, split, backend, g, arena_pages, rendezvous, arm_dir):
                                 index_head_dim=g.index_dim, dtype=torch.int8)
     args = SimpleNamespace(tp_size=ranks, pp_size=1, dp_size=1, nnodes=1, node_rank=0,
                            attn_cp_size=ranks, enable_dp_attention=False, kv_cache_dtype=None,
-                           enable_nsa_cache_layer_split=split, model_path="synthetic-hy4-target")
+                           enable_nsa_cache_layer_split=split, model_path="synthetic-target-model")
     # Supply the actual Gloo world group at the framework hook so FlexKVComm
     # neither imports nor calls SGLang. All collectives below run FlexKV code.
     original_comm = adapter.FlexKVComm
@@ -740,7 +740,7 @@ def summarize(rounds):
 
 def run_arm(exp, split, backend, g, arm_dir):
     arm_dir.mkdir()
-    with tempfile.TemporaryDirectory(prefix="hy4-gdr-", dir="/tmp") as directory:
+    with tempfile.TemporaryDirectory(prefix="kv-transfer-", dir="/tmp") as directory:
         scratch = Path(directory)
         (scratch / "config.json").write_text(json.dumps({"cpu_cache_gb": exp.host_cache_gib,
                                                          "ssd_cache_gb": 0,
@@ -754,7 +754,7 @@ def run_arm(exp, split, backend, g, arm_dir):
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1) as proc:
             for line in proc.stdout:
                 log.write(line)
-                if line.startswith("[HY4-BENCH]"):
+                if line.startswith(PROGRESS_MARKER):
                     print(line.rstrip(), flush=True)
             if proc.wait() != 0:
                 raise RuntimeError(f"{exp.name}/{backend}/split={split} failed. See {log_path}")
@@ -778,7 +778,7 @@ def run_arm(exp, split, backend, g, arm_dir):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", action="store_true", help="validate and print the matrix without GPU imports")
-    parser.add_argument("--output", type=Path, default=Path(time.strftime("hy4-transfer-%Y%m%d-%H%M%S")))
+    parser.add_argument("--output", type=Path, default=Path(time.strftime("kv-transfer-%Y%m%d-%H%M%S")))
     parser.add_argument("--run-arm", nargs=5, help=argparse.SUPPRESS)
     args = parser.parse_args()
     g = geometry()
@@ -812,11 +812,11 @@ def main():
     report_path = output / "report.json"
     for exp in EXPERIMENTS:
         for split, backend in itertools.product(exp.layer_split, exp.backends):
-            print(f"[HY4-BENCH] starting {exp.name} backend={backend} split={int(split)}", flush=True)
+            print(f"{PROGRESS_MARKER} starting {exp.name} backend={backend} split={int(split)}", flush=True)
             row = run_arm(exp, split, backend, g, output / f"{exp.name}-{backend}-split{int(split)}")
             report["arms"].append(row)
             report_path.write_text(json.dumps(report, indent=2) + "\n")
-    print(f"[HY4-BENCH] report {report_path}", flush=True)
+    print(f"{PROGRESS_MARKER} report {report_path}", flush=True)
 
 
 if __name__ == "__main__":
