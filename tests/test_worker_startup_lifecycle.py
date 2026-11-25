@@ -95,6 +95,20 @@ def test_health_checked_after_ready_and_during_wait():
         handle.wait(timeout=0)
 
 
+def test_pending_dma_reports_session_fault_across_process_pipe():
+    from flexkv.transfer.local_gdr import LocalGdrQuarantined
+
+    handle = tm.TransferManagerInterProcessHandle(NS(tp_size=1, dp_size=1), NS(), "/tmp/unused")
+    try:
+        handle.error_child_conn.send(LocalGdrQuarantined("uncertain RDMA drain"))
+        with pytest.raises(LocalGdrQuarantined, match="uncertain RDMA drain"):
+            handle.wait(timeout=0)
+        with pytest.raises(LocalGdrQuarantined, match="uncertain RDMA drain"):
+            handle.submit_batch([])
+    finally:
+        handle.shutdown()
+
+
 def test_connector_ready_wait_has_deadline(monkeypatch):
     connector = FlexKVConnector.__new__(FlexKVConnector)
     connector.kv_manager = Mock()

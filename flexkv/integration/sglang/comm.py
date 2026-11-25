@@ -33,7 +33,7 @@ import socket
 import struct
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -740,6 +740,7 @@ class FlexKVLayerLoadingEvent:
         layer_index: int,
         count: int = 1,
         timeout_s: Optional[float] = None,
+        check_health: Optional[Callable[[], None]] = None,
     ) -> None:
         """Block until the FlexKV worker signals layer ``layer_index``.
 
@@ -761,8 +762,15 @@ class FlexKVLayerLoadingEvent:
                 timeout = None
                 if deadline is not None:
                     timeout = max(0.0, deadline - time.monotonic())
+                if check_health is not None:
+                    check_health()
+                    timeout = min(0.05, timeout) if timeout is not None else 0.05
                 readable, _, _ = select.select([fd], [], [], timeout)
                 if not readable:
+                    if check_health is not None:
+                        check_health()
+                        if deadline is None or time.monotonic() < deadline:
+                            continue
                     raise TimeoutError(
                         "Timed out waiting for a FlexKV layerwise eventfd signal"
                     )
@@ -798,10 +806,12 @@ class FlexKVLayerDoneCounter:
     prefill batch, and the fixed-size ring remains sufficient for large batches.
     """
 
-    def __init__(self, num_layers: int, num_counters: int = 3, world_rank: int = -1):
+    def __init__(self, num_layers: int, num_counters: int = 3, world_rank: int = -1,
+                 check_health: Optional[Callable[[], None]] = None):
         self.num_layers = num_layers
         self.num_counters = num_counters
         self.world_rank = world_rank
+        self._check_health = check_health
         timeout_raw = os.environ.get("FLEXKV_LAYERWISE_WAIT_TIMEOUT_S", "240")
         try:
             timeout_s = float(timeout_raw)
@@ -978,16 +988,20 @@ class FlexKVLayerDoneCounter:
         if self.consumer_index < 0:
             return
         event = self.events[self.consumer_index]
+        check_health = getattr(self, "_check_health", None)
+        if check_health is not None:
+            check_health()
         wait_count = event.wait_remaining[threshold]
         if wait_count <= 0:
             return
-        event.wait_remaining[threshold] = 0
         try:
             event.wait(
                 threshold,
                 wait_count,
                 timeout_s=getattr(self, "wait_timeout_s", None),
+                check_health=check_health,
             )
+            event.wait_remaining[threshold] = 0
         except TimeoutError as exc:
             task_ids = list(getattr(self, "_consumer_task_ids", []))
             rank = getattr(self, "world_rank", -1)

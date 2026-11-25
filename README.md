@@ -141,17 +141,31 @@ the GPU memory registration interface:
 and `mapped` with `FLEXKV_ENABLE_KERNEL_TRANSFER=0`.
 Set `FLEXKV_LOCAL_GDR=h2d`, `d2h` or `both` in the serving environment.
 The default is `off`. An enabled direction requires a complete local Owner
-registration. `FLEXKV_GDR_NICS` can specify a comma-separated NIC per local
-rank when PCIe proximity is ambiguous. `FLEXKV_GDR_READBACKS` sets the maximum
-mapped H2D read-backs in flight per route (default 1). It must fit the negotiated
-READ depth, optionally requested through `FLEXKV_GDR_READ_DEPTH`.
+registration. `FLEXKV_GDR_NICS` can specify a comma-separated `NIC` or
+`NIC:PORT` per local rank. Without `:PORT`, FlexKV uses the first active port.
+`FLEXKV_GDR_READBACKS` sets the maximum mapped H2D read-backs in flight per
+route. `0` (default) chooses up to four within the available SQ and READ
+depth. An explicit value must fit those limits. `FLEXKV_GDR_READ_DEPTH`
+can request a particular READ depth.
+
+Mapped H2D is experimental and requires `FLEXKV_GDR_EXPERIMENTAL_MAPPED_H2D=1`.
+The read-back and runtime synchronization sequence needs validation of GPU
+visibility on the deployed stack. On the target host, run the reused-block
+test using the serving GPU runtime and the selected NIC:
+
+```bash
+FLEXKV_LOCAL_GDR=h2d FLEXKV_ENABLE_CE_ONLY=1 \
+  FLEXKV_GDR_EXPERIMENTAL_MAPPED_H2D=1 FLEXKV_RUN_GDR_VISIBILITY_TEST=1 \
+  python -m unittest discover -s tests -p test_local_gdr_visibility.py -v
+```
 
 This backend needs platform acceptance before production use. Verify the
 actual model's merged layerwise restore, D2H, device ordering and isolation
 after a Worker or Owner failure. `FLEXKV_GDR_LOG_COUNTERS=1` reports per-route
-payload bytes, WRs, CQEs and read-backs on clean shutdown. A quarantined
-instance retains its registered buffers and requires platform isolation
-before teardown or restart.
+payload bytes, WRs, CQEs and read-backs on clean shutdown. The 30-second
+CQ watchdog runs only while RDMA WRs are outstanding and resets on CQ
+progress. A fault without proof of drain retains the registered buffers
+and requires platform isolation before their teardown or reuse.
 
 ### Use FlexKV with vLLM
 

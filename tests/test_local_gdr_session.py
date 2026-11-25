@@ -1,6 +1,7 @@
 """CPU-only regressions for the local GDR Owner lease protocol."""
 
 import importlib.util
+import os
 import socket
 import sys
 import threading
@@ -36,6 +37,7 @@ class LocalGdrLeaseTest(unittest.TestCase):
         owner.fingerprint = "local"
         owner.lock = threading.Lock()
         owner.sessions = set()
+        owner.confirmed_sockets = set()
         owner.retiring = owner.uncertain = False
         caller, owner_fd = socket.socketpair()
         caller.settimeout(1)
@@ -79,6 +81,41 @@ class LocalGdrLeaseTest(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertFalse(owner.uncertain)
         owner.endpoint.release.assert_called_once_with(8)
+
+    def test_peer_loss_detected_while_owner_waits_for_gpu(self):
+        waiting = threading.Event()
+        ready = threading.Event()
+
+        def wait_for_gpu(_):
+            waiting.set()
+            ready.wait(2)
+
+        self.native.gdr_producer_ready.side_effect = wait_for_gpu
+        owner, caller, thread = self.start_lease()
+        self.addCleanup(ready.set)
+        caller.sendall(b"CR")
+        self.assertEqual(caller.recv(1), b"A")
+        self.assertTrue(waiting.wait(1))
+        owner.check_healthy()
+        caller.close()
+        with self.assertRaises(local_gdr.LocalGdrQuarantined):
+            owner.check_healthy()
+        self.assertTrue(thread.is_alive())
+        ready.set()
+        thread.join(1)
+        owner.endpoint.release.assert_not_called()
+
+    def test_mapped_h2d_requires_explicit_opt_in(self):
+        self.native.gdr_uses_mapped_memory = True
+        self.native.GdrOwnerEndpoint = Mock()
+        debug = types.SimpleNamespace(flexkv_logger=Mock())
+        tensor = types.SimpleNamespace(is_cuda=True, device=types.SimpleNamespace(index=0))
+        with patch.dict(os.environ, {"FLEXKV_LOCAL_GDR": "h2d"}, clear=True), patch.dict(
+            sys.modules, {"flexkv.common.debug": debug}
+        ):
+            with self.assertRaisesRegex(RuntimeError, "FLEXKV_GDR_EXPERIMENTAL_MAPPED_H2D"):
+                local_gdr.Owner([tensor], 0)
+        self.native.GdrOwnerEndpoint.assert_not_called()
 
     def test_sender_teardown_precedes_owner_ack(self):
         order = []

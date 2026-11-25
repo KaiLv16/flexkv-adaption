@@ -395,7 +395,7 @@ if enable_metrics:
     extra_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
 if enable_gdr:
     cpp_sources.extend(["csrc/gdr/transport.cpp", "csrc/gdr/region_adapter.cpp"])
-    hpp_sources.extend(["csrc/gdr/bindings.h", "csrc/gdr/transport.h", "csrc/gdr/region_adapter.h",
+    hpp_sources.extend(["csrc/gdr/bindings.h", "csrc/gdr/cq_watchdog.h", "csrc/gdr/transport.h", "csrc/gdr/region_adapter.h",
                         "csrc/gdr/topology.h"])
     extra_compile_args.append("-DFLEXKV_ENABLE_GDR")
     if gdr_backend == "mapped":

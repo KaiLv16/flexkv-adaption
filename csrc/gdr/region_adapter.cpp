@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "gdr/region_adapter.h"
+#include "gdr/cq_watchdog.h"
 
 #include "device_thread_pool.h"
 #include "region_batch.h"
@@ -19,7 +20,7 @@ namespace gdr {
 namespace {
 
 constexpr size_t kWindow = 16;
-constexpr auto kNoProgressTimeout = std::chrono::seconds(30);
+constexpr auto kCqTimeout = std::chrono::seconds(30);
 
 struct BlockAddress {
   const GTensorHandler &handler;
@@ -138,7 +139,7 @@ struct RegionAdapter::Route {
            const std::function<void(int)> &rank_visible) {
     if (work.empty()) return;
     auto &transport = *sender;
-    auto deadline = std::chrono::steady_clock::now() + kNoProgressTimeout;
+    CqWatchdog cq_watchdog(kCqTimeout);
     bool producer_sent = false;
     bool producer_ready = h2d;
     size_t region = 0;
@@ -151,13 +152,18 @@ struct RegionAdapter::Route {
     size_t head = 0, tail = 0, next_visibility = 0;
     bool had_payload = false;
     unsigned idle = 0;
+    int backoff_us = 10;
 
     while (region < work.size() || head != tail) {
       if (stop.load(std::memory_order_acquire) || stopped.load(std::memory_order_acquire))
         throw UnsafeTransfer("GDR: local transfer stopped");
-      bool progress = transport.poll() > 0;
+      const bool completed = transport.poll() > 0;
+      bool progress = completed;
       if (!producer_ready) {
-        if (!producer_sent) producer_sent = send_command(control_fd, 'R');
+        if (!producer_sent) {
+          producer_sent = send_command(control_fd, 'R');
+          progress |= producer_sent;
+        }
         if (producer_sent) producer_ready = receive_ack(control_fd);
         progress |= producer_ready;
       }
@@ -226,13 +232,15 @@ struct RegionAdapter::Route {
         }
       }
 
+      const bool outstanding = transport.posted() != transport.retired();
+      if (cq_watchdog.expired(CqWatchdog::Clock::now(), outstanding, completed))
+        throw UnsafeTransfer("GDR: timed out waiting for outstanding RDMA completions");
       if (progress) {
-        deadline = std::chrono::steady_clock::now() + kNoProgressTimeout;
         idle = 0;
-      } else if (++idle % 128 == 0) {
-        if (std::chrono::steady_clock::now() >= deadline)
-          throw UnsafeTransfer("GDR: timed out waiting for CQ progress or Owner ordering");
-        std::this_thread::yield();
+        backoff_us = 10;
+      } else if (++idle >= 64) {
+        std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+        backoff_us = std::min(backoff_us * 2, outstanding ? 50 : 1000);
       }
     }
   }

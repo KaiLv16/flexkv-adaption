@@ -53,6 +53,7 @@ from flexkv.transfer.compression import build_compressors, NullCompressionStrate
 from flexkv.transfer.cuda_sync import synchronize_cuda_devices
 from flexkv.transfer.completion import CompletionContract
 from flexkv.transfer.layer_eventfd import build_layerwise_eventfd_socket_path
+from flexkv.transfer.local_gdr import LocalGdrQuarantined
 from flexkv.transfer.worker_op import WorkerTransferIncident, WorkerTransferResult
 from flexkv.common.config import (
     CacheConfig, LayerGroupSpec, ModelConfig, GLOBAL_CONFIG_FROM_ENV,
@@ -165,9 +166,8 @@ class TransferEngine:
         self.op_id_to_op: Dict[int, TransferOp] = {}
         self._local_gdr_workers = set()
         self._local_gdr_stop = None
-        self._local_gdr_deadlines: Dict[int, float] = {}
+        self._local_gdr_inflight = set()
         self._local_gdr_incident: Optional[str] = None
-        self._local_gdr_timeout = 120.0
         self._local_gdr_dispatch_lock = threading.Lock()
 
         # Create shutdown pipe for zero-latency selector
@@ -999,19 +999,14 @@ class TransferEngine:
 
         while self._running:
             try:
-                # Complete blocking with NO TIMEOUT for zero latency!
-                # Shutdown via pipe signal instead of timeout
-                deadline = min(self._local_gdr_deadlines.values(), default=None)
-                timeout = max(0.0, deadline - time.monotonic()) if deadline is not None else None
-                events = sel.select(timeout=timeout)
+                # Watch worker exit and reports. Only the running route owns
+                # a CQ watchdog, so queued ops have no wall-clock deadline.
+                events = sel.select()
                 for key, _ in events:
                     if isinstance(key.data, WorkerHandle):
                         self._quarantine_local_gdr(f"Worker {key.data.worker_id} exited")
                         break
                 if self._local_gdr_incident:
-                    break
-                if deadline is not None and deadline <= time.monotonic() and not events:
-                    self._quarantine_local_gdr("Worker deadline expired")
                     break
 
                 new_graphs_num = 0
@@ -1078,7 +1073,9 @@ class TransferEngine:
                                         op_id = first
                                 else:
                                     op_id = payload
-                                self._local_gdr_deadlines.pop(op_id, None)
+                                if self._local_gdr_workers:
+                                    with self._local_gdr_dispatch_lock:
+                                        self._local_gdr_inflight.discard(op_id)
                                 if not op_succeeded:
                                     # Keep trace state consistent even on failure.
                                     trace.dec_inflight()
@@ -1123,10 +1120,6 @@ class TransferEngine:
 
                 # Exit loop if shutdown requested
                 if should_shutdown or self._local_gdr_incident:
-                    break
-                if (self._local_gdr_deadlines
-                        and min(self._local_gdr_deadlines.values()) <= time.monotonic()):
-                    self._quarantine_local_gdr("Worker deadline expired")
                     break
 
                 # End NVTX ranges for finished ops
@@ -1563,20 +1556,25 @@ class TransferEngine:
             with self._local_gdr_dispatch_lock:
                 if not self._running:
                     return
-                self._local_gdr_deadlines[op.op_id] = time.monotonic() + self._local_gdr_timeout
+                self._local_gdr_inflight.add(op.op_id)
                 worker.submit_transfer(op)
             return
         worker.submit_transfer(op)
 
     def _quarantine_local_gdr(self, reason: str) -> None:
+        if self._local_gdr_incident:
+            return
         self._local_gdr_incident = reason
         if self._local_gdr_stop is not None:
             self._local_gdr_stop.set()
+        # A failed graph is a drain certificate for its task. Report the
+        # session fault separately so the task layer retains its reservations.
+        self.completed_queue.put(LocalGdrQuarantined(reason))
         flexkv_logger.error("Local GDR quarantined; transfer graph and pools retained: %s", reason)
 
     def _check_local_gdr(self) -> None:
         if self._local_gdr_incident:
-            raise RuntimeError(f"Local GDR remains quarantined: {self._local_gdr_incident}")
+            raise LocalGdrQuarantined(f"Local GDR remains quarantined: {self._local_gdr_incident}")
 
     def submit_transfer_graph(self, transfer_graph: Union[TransferOpGraph, List[TransferOpGraph]]) -> None:
         """Submit a transfer graph for execution"""
@@ -1606,6 +1604,7 @@ class TransferEngine:
                 first_op = self.completed_queue.get(timeout=timeout)
             completed_ops.append(first_op)
         except queue.Empty:
+            self._check_local_gdr()
             return completed_ops
 
         # Drain whatever else is immediately available.
@@ -1615,6 +1614,7 @@ class TransferEngine:
             except queue.Empty:
                 break
 
+        self._check_local_gdr()
         return completed_ops
 
     def suspend_gpu_mappings(self) -> int:
@@ -1675,15 +1675,13 @@ class TransferEngine:
 
     def shutdown(self) -> None:
         """Shutdown the transfer engine"""
-        self._check_local_gdr()
         if not self._running:
             return
         if self._local_gdr_workers:
             with self._local_gdr_dispatch_lock:
-                self._check_local_gdr()
                 if not self._running:
                     return
-                if self._local_gdr_deadlines:
+                if self._local_gdr_inflight and not self._local_gdr_incident:
                     raise RuntimeError("Local GDR transfers must drain before shutdown")
                 self._running = False
         try:
@@ -1709,9 +1707,12 @@ class TransferEngine:
                 else:
                     flexkv_logger.debug(f"Shutdown pipes already closed: {e}")
 
-            # Shutdown all workers in parallel so large cudaHostUnregister
-            # work overlaps across processes instead of stacking timeouts.
-            self._shutdown_worker_handles(self._collect_worker_handles())
+            # Shut down eligible workers in parallel so cudaHostUnregister
+            # overlaps across processes.
+            handles = self._collect_worker_handles()
+            if self._local_gdr_incident:
+                handles = [handle for handle in handles if handle not in self._local_gdr_workers]
+            self._shutdown_worker_handles(handles)
         except Exception as e:
             self._check_local_gdr()
             flexkv_logger.error(f"Error during shutdown: {e}")

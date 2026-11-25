@@ -2,6 +2,7 @@
 
 import json
 import os
+import select
 import socket
 import tempfile
 import threading
@@ -9,6 +10,11 @@ import threading
 _PROTOCOL = "flexkv-local-gdr-1"
 _TIMEOUT = 30
 _owners = set()
+_PEER_CLOSED = select.POLLHUP | select.POLLERR | getattr(select, "POLLRDHUP", 0)
+
+
+class LocalGdrQuarantined(RuntimeError):
+    """The transfer session lost its DMA drain guarantee."""
 
 
 def enabled(direction=None):
@@ -51,6 +57,9 @@ class Owner:
         depth = int(os.environ.get("FLEXKV_GDR_READ_DEPTH", "0"))
         if not hasattr(c_ext, "GdrOwnerEndpoint"):
             raise RuntimeError("Build c_ext with FLEXKV_ENABLE_GDR=1")
+        if (enabled("h2d") and c_ext.gdr_uses_mapped_memory
+                and os.environ.get("FLEXKV_GDR_EXPERIMENTAL_MAPPED_H2D") != "1"):
+            raise RuntimeError("Mapped GDR H2D requires FLEXKV_GDR_EXPERIMENTAL_MAPPED_H2D=1")
         self.endpoint = c_ext.GdrOwnerEndpoint(self.device, nic, depth)
         if enabled("h2d"):
             c_ext.gdr_device_visible(self.device)
@@ -63,6 +72,7 @@ class Owner:
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.lock = threading.Lock()
         self.sessions = set()
+        self.confirmed_sockets = set()
         self.retiring = False
         self.uncertain = False
         try:
@@ -133,6 +143,8 @@ class Owner:
                 # The sender can post only after acknowledging connection and
                 # receiving its lease confirmation. Treat lost confirmation as unsafe.
                 posted_possible = True
+                with self.lock:
+                    self.confirmed_sockets.add(conn)
                 stream.write(b"A")
                 stream.flush()
                 conn.settimeout(None)
@@ -146,6 +158,7 @@ class Owner:
                         with self.lock:
                             self.endpoint.release(qpn)
                             qpn = None
+                            self.confirmed_sockets.discard(conn)
                         stream.write(b"A")
                         stream.flush()
                         return
@@ -157,6 +170,7 @@ class Owner:
             self._log.error("Local GDR owner session failed: %s", exc)
         finally:
             with self.lock:
+                self.confirmed_sockets.discard(conn)
                 if qpn is not None:
                     if posted_possible:
                         # A dropped connection does not revoke DMA. Retain the
@@ -169,6 +183,22 @@ class Owner:
                         except Exception:
                             self.uncertain = True
                 self.sessions.discard(threading.current_thread())
+
+    def check_healthy(self):
+        """Observe a lost sender even while its Owner command is in a CUDA call."""
+        with self.lock:
+            if not self.uncertain and self.confirmed_sockets:
+                poller = select.poll()
+                for conn in self.confirmed_sockets:
+                    fd = conn.fileno()
+                    if fd < 0:
+                        self.uncertain = True
+                        break
+                    poller.register(fd, _PEER_CLOSED)
+                if poller.poll(0):
+                    self.uncertain = True
+            if self.uncertain:
+                raise LocalGdrQuarantined("Local GDR Owner lost a confirmed Worker lease")
 
     def retire(self):
         with self.lock:
@@ -215,9 +245,9 @@ def attach_routes(group, devices, tensors, host_tensors):
 
     leases = []
     confirmed = []
-    readbacks = int(os.environ.get("FLEXKV_GDR_READBACKS", "1"))
-    if not 1 <= readbacks <= 16:
-        raise ValueError("FLEXKV_GDR_READBACKS must be 1..16")
+    readbacks = int(os.environ.get("FLEXKV_GDR_READBACKS", "0"))
+    if not 0 <= readbacks <= 16:
+        raise ValueError("FLEXKV_GDR_READBACKS must be 0 (auto) or 1..16")
     try:
         for rank, device in enumerate(devices):
             views = {}

@@ -17,6 +17,11 @@ struct PendingSender {
 };
 
 inline void bind(py::module_ &m, py::class_<RegionBatchGroup> &batch) {
+#ifdef FLEXKV_GDR_MAPPED
+  m.attr("gdr_uses_mapped_memory") = true;
+#else
+  m.attr("gdr_uses_mapped_memory") = false;
+#endif
   py::register_exception<UnsafeTransfer>(m, "UnsafeGdrTransfer");
   py::class_<Transport>(m, "GdrOwnerEndpoint")
       .def(py::init([](int device, const std::string &nic, int depth) {

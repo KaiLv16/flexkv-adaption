@@ -62,6 +62,19 @@ PageWindow verbs_page_window(void *p,size_t bytes) {
   return {reinterpret_cast<void *>(aligned),static_cast<size_t>(aligned_end-aligned)};
 }
 
+int active_port(ibv_context *ctx, int requested, ibv_port_attr &port) {
+  ibv_device_attr device{};
+  if (ibv_query_device(ctx, &device) != 0 || requested > device.phys_port_cnt)
+    return 0;
+  const int first = requested ? requested : 1;
+  const int last = requested ? requested : device.phys_port_cnt;
+  for (int index = first; index <= last; ++index) {
+    if (ibv_query_port(ctx, index, &port) == 0 && port.state == IBV_PORT_ACTIVE)
+      return index;
+  }
+  return 0;
+}
+
 }  // namespace
 
 struct Transport::Impl {
@@ -71,6 +84,7 @@ struct Transport::Impl {
     uint32_t bytes;
     int scratch;
     uint64_t fence;
+    bool signaled;
   };
 
   ibv_context *ctx = nullptr;
@@ -81,6 +95,7 @@ struct Transport::Impl {
   std::vector<Mr> hosts, devices;
   std::vector<RemoteRegion> remote_regions;
   ibv_port_attr port{};
+  int port_num = 0;
   ibv_gid gid{};
   int gid_index = 0;
   int depth = 0;
@@ -89,7 +104,7 @@ struct Transport::Impl {
   bool sender = false;
   bool connected = false;
   bool unsafe = false;
-  std::string name, endpoint;
+  std::string name, nic_selector, endpoint;
   size_t host_hint = 0;
   size_t remote_hint = 0;
 
@@ -153,7 +168,7 @@ struct Transport::Impl {
     if(!rc) return;
     std::ostringstream error;
     error << "GDR: QP " << stage << " failed: nic=" << name
-          << " port=1 gid_index=" << gid_index << " qpn=" << q->qp_num
+          << " port=" << port_num << " gid_index=" << gid_index << " qpn=" << q->qp_num
           << " peer=" << a.dest_qp_num << " mtu=" << port.active_mtu
           << " link_layer=" << int(port.link_layer) << " read_depth=" << read_depth
           << " rc=" << rc << " (" << std::strerror(rc>0?rc:saved_errno) << ")"
@@ -163,7 +178,7 @@ struct Transport::Impl {
   void init_qp(ibv_qp *q) {
     // Port/P_Key/GID select a shared fabric endpoint, not exclusive resources.
     // PSNs start at zero on each new RC connection; they are scoped to its QP.
-    ibv_qp_attr a{};a.qp_state=IBV_QPS_INIT;a.port_num=1;
+    ibv_qp_attr a{};a.qp_state=IBV_QPS_INIT;a.port_num=port_num;
     a.qp_access_flags=IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_REMOTE_READ;
     modify(q,a,IBV_QP_STATE|IBV_QP_PKEY_INDEX|IBV_QP_PORT|IBV_QP_ACCESS_FLAGS,"INIT");
   }
@@ -171,10 +186,10 @@ struct Transport::Impl {
     require(peer>0 && peer<=0xffffff,"invalid peer QPN");
     if(!initialized) init_qp(q);
     ibv_qp_attr a{};a.qp_state=IBV_QPS_RTR;a.path_mtu=port.active_mtu;a.dest_qp_num=peer;
-    a.max_dest_rd_atomic=read_depth;a.min_rnr_timer=12;a.ah_attr.port_num=1;
+    a.max_dest_rd_atomic=read_depth;a.min_rnr_timer=12;a.ah_attr.port_num=port_num;
     if(port.link_layer==IBV_LINK_LAYER_ETHERNET) {
       a.ah_attr.is_global=1;a.ah_attr.grh.dgid=gid;
-      a.ah_attr.grh.sgid_index=gid_index;a.ah_attr.grh.hop_limit=1;
+      a.ah_attr.grh.sgid_index=gid_index;a.ah_attr.grh.hop_limit=64;
     } else a.ah_attr.dlid=port.lid;
     modify(q,a,IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|IBV_QP_DEST_QPN|IBV_QP_RQ_PSN|IBV_QP_MAX_DEST_RD_ATOMIC|IBV_QP_MIN_RNR_TIMER,"RTR");
     a={};a.qp_state=IBV_QPS_RTS;a.timeout=14;a.retry_cnt=7;a.rnr_retry=7;a.max_rd_atomic=read_depth;
@@ -239,6 +254,17 @@ Transport::Transport(int device, bool sender, const std::string &nic,
   std::unique_ptr<ibv_device*,decltype(&ibv_free_device_list)> list(raw,ibv_free_device_list);
   require(raw && n,"no verbs devices; check rdma-core providers and /dev/infiniband");
   std::string selected_nic=nic;
+  int requested_port = 0;
+  const auto colon = selected_nic.find(':');
+  if (colon != std::string::npos) {
+    const auto suffix = selected_nic.substr(colon + 1);
+    require(colon != 0 && !suffix.empty() && suffix.size() <= 3 &&
+            suffix.find_first_not_of("0123456789") == std::string::npos,
+            "FLEXKV_GDR_NICS must use NIC or NIC:PORT");
+    requested_port = std::stoi(suffix);
+    require(requested_port > 0 && requested_port <= 255, "invalid RDMA port number");
+    selected_nic.resize(colon);
+  }
   char bus[32]{};
   const auto pci_status=cudaDeviceGetPCIBusId(bus,sizeof(bus),device);
   std::string bdf=pci_status==cudaSuccess ? bus : "";
@@ -256,7 +282,7 @@ Transport::Transport(int device, bool sender, const std::string &nic,
       const std::string name=ibv_get_device_name(raw[i]);
       auto ctx=ibv_open_device(raw[i]);if(!ctx) continue;
       ibv_port_attr port{};
-      const bool active=ibv_query_port(ctx,1,&port)==0 && port.state==IBV_PORT_ACTIVE;
+      const bool active=active_port(ctx, 0, port) != 0;
       ibv_close_device(ctx);
       if(active) candidates.emplace_back(name,canonical("/sys/class/infiniband/"+name+"/device"));
     }
@@ -268,18 +294,21 @@ Transport::Transport(int device, bool sender, const std::string &nic,
     if(selected_nic!=ibv_get_device_name(raw[i])) continue;
     e.ctx=ibv_open_device(raw[i]);e.name=selected_nic;break;
   }
-  require(e.ctx && ibv_query_port(e.ctx,1,&e.port)==0 && e.port.state==IBV_PORT_ACTIVE,
-          "selected NIC port 1 is unavailable; check FLEXKV_GDR_NICS and RDMA port state");
+  require(e.ctx, "selected NIC is unavailable; check FLEXKV_GDR_NICS");
+  e.port_num = active_port(e.ctx, requested_port, e.port);
+  require(e.port_num, "selected NIC has no matching active port; check FLEXKV_GDR_NICS and RDMA port state");
+  const auto port_string = std::to_string(e.port_num);
+  e.nic_selector = e.name + ":" + port_string;
   struct Candidate {int priority,index;ibv_gid gid;};
   std::vector<Candidate> candidates;
   if(e.port.link_layer==IBV_LINK_LAYER_ETHERNET) {
     for(int i=0;i<e.port.gid_tbl_len;++i) {
-      std::ifstream f("/sys/class/infiniband/"+e.name+"/ports/1/gid_attrs/types/"+std::to_string(i));
+      std::ifstream f("/sys/class/infiniband/"+e.name+"/ports/"+port_string+"/gid_attrs/types/"+std::to_string(i));
       std::string type;std::getline(f,type);
       const bool v2=type.find("RoCE v2")!=std::string::npos;
       const bool v1=type.find("RoCE v1")!=std::string::npos;
       ibv_gid gid{};
-      if((!v1 && !v2) || ibv_query_gid(e.ctx,1,i,&gid)) continue;
+      if((!v1 && !v2) || ibv_query_gid(e.ctx,e.port_num,i,&gid)) continue;
       bool nonzero=false;for(auto v:gid.raw) nonzero |= v!=0;
       const bool local=gid.raw[0]==0xfe && (gid.raw[1]&0xc0)==0x80;
       if(nonzero) candidates.push_back({v2?(local?1:0):2,i,gid});
@@ -298,7 +327,8 @@ Transport::Transport(int device, bool sender, const std::string &nic,
   require(requested_depth >= 0 && requested_depth <= capacity, "invalid READ depth");
   e.read_depth = requested_depth ? requested_depth : std::min(capacity, 16);
 #ifdef FLEXKV_GDR_MAPPED
-  e.fence_depth = requested_fences;
+  e.fence_depth = sender && requested_fences == 0
+      ? std::min({4, e.depth - 1, e.read_depth}) : requested_fences;
   require(!sender || (e.fence_depth > 0 && e.fence_depth < e.depth &&
       e.fence_depth <= e.read_depth && e.fence_depth <= static_cast<int>(Impl::kMaxFences)),
       "invalid mapped read-back depth");
@@ -327,7 +357,7 @@ Transport::Transport(int device, bool sender, const std::string &nic,
 #else
     const char *registration = "native";
 #endif
-    e.endpoint = std::string(registration) + "|" + bdf + "|" + e.name + "|1|" + std::to_string(e.gid_index) + "|" +
+    e.endpoint = std::string(registration) + "|" + bdf + "|" + e.name + "|" + port_string + "|" + std::to_string(e.gid_index) + "|" +
                  std::to_string(e.port.active_mtu) + "|" + std::to_string(e.port.lid);
     for (auto byte : e.gid.raw) e.endpoint += "|" + std::to_string(byte);
     if (!required_endpoint.empty() && required_endpoint != e.endpoint) continue;
@@ -412,19 +442,19 @@ RemoteRegion Transport::export_region(void *base, size_t bytes) const {
 
 const std::string &Transport::endpoint() const {
   auto &e=*p_;ibv_port_attr port{};
-  require(ibv_query_port(e.ctx,1,&port)==0 && port.state==IBV_PORT_ACTIVE &&
+  require(ibv_query_port(e.ctx,e.port_num,&port)==0 && port.state==IBV_PORT_ACTIVE &&
       port.link_layer==e.port.link_layer && port.active_mtu==e.port.active_mtu &&
       port.lid==e.port.lid,"NIC port changed; restart endpoints");
   if(e.port.link_layer==IBV_LINK_LAYER_ETHERNET) {
     ibv_gid current{};
-    require(ibv_query_gid(e.ctx,1,e.gid_index,&current)==0 &&
+    require(ibv_query_gid(e.ctx,e.port_num,e.gid_index,&current)==0 &&
         std::memcmp(current.raw,e.gid.raw,sizeof(current.raw))==0,
         "GID changed; restart endpoints");
   }
   return e.endpoint;
 }
 
-const std::string &Transport::nic() const { return p_->name; }
+const std::string &Transport::nic() const { return p_->nic_selector; }
 int Transport::read_depth() const { return p_->read_depth; }
 uint32_t Transport::sender_qpn() const {
   require(p_->qp, "sender QP does not exist");
@@ -520,14 +550,19 @@ size_t Transport::post_payload(const Span *spans, size_t count, bool h2d) {
     wr.sg_list = &e.sges[actual];
     wr.num_sge = 1;
     wr.opcode = h2d ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
-    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.send_flags = h2d ? 0 : IBV_SEND_SIGNALED;
     wr.wr.rdma.remote_addr = span.remote;
     wr.wr.rdma.rkey = span.rkey;
     if (actual) e.wrs[actual - 1].next = &wr;
-    e.ledger[seq % e.depth] = {seq, !h2d, span.bytes, -1, 0};
+    e.ledger[seq % e.depth] = {seq, !h2d, span.bytes, -1, 0, !h2d};
     bytes += span.bytes;
   }
   if (!actual) return 0;
+  // The tail CQE of an ordered RC write chain retires its unsignaled prefix.
+  if (h2d) {
+    e.wrs[actual - 1].send_flags = IBV_SEND_SIGNALED;
+    e.ledger[(e.posted + actual) % e.depth].signaled = true;
+  }
   e.post(actual);
   e.payload_bytes += bytes;
   if (!h2d) e.reads += static_cast<int>(actual);
@@ -555,7 +590,7 @@ bool Transport::post_readback(const Span &last_write, uint64_t fence) {
   wr.send_flags = IBV_SEND_SIGNALED;
   wr.wr.rdma.remote_addr = last_write.remote;
   wr.wr.rdma.rkey = last_write.rkey;
-  e.ledger[seq % e.depth] = {seq, true, 0, slot, fence};
+  e.ledger[seq % e.depth] = {seq, true, 0, slot, fence, true};
   e.post(1);
   *free = true;
   ++e.reads;
@@ -575,17 +610,22 @@ int Transport::poll() {
     if (wc[i].status != IBV_WC_SUCCESS)
       e.fail("CQE failed, WC status=" + std::to_string(wc[i].status));
     const auto seq = wc[i].wr_id;
-    if (seq != e.retired + 1 || seq > e.posted || e.ledger[seq % e.depth].sequence != seq)
+    if (seq <= e.retired || seq > e.posted || !e.ledger[seq % e.depth].signaled)
       e.fail("invalid CQE sequence");
-    const auto &op = e.ledger[seq % e.depth];
-    e.payload_bytes -= op.bytes;
-    if (op.read) --e.reads;
-    if (op.scratch >= 0) {
-      e.scratch_used[op.scratch] = false;
-      --e.fences;
-      e.fence_retired = op.fence;
+    while (e.retired < seq) {
+      const auto next = e.retired + 1;
+      const auto &op = e.ledger[next % e.depth];
+      if (op.sequence != next || op.signaled != (next == seq))
+        e.fail("invalid CQE prefix");
+      e.payload_bytes -= op.bytes;
+      if (op.read) --e.reads;
+      if (op.scratch >= 0) {
+        e.scratch_used[op.scratch] = false;
+        --e.fences;
+        e.fence_retired = op.fence;
+      }
+      e.retired = next;
     }
-    e.retired = seq;
   }
   e.stats.completions += count;
   return count;

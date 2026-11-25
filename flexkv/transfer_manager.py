@@ -7,7 +7,7 @@ import time
 import queue
 import selectors
 from queue import Queue
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Dict, Optional, List, Tuple, Any, Union
 from abc import ABC, abstractmethod
 from multiprocessing import Process, Pipe, Event
 from sympy.assumptions.assume import true
@@ -35,6 +35,7 @@ from flexkv.common.transfer import DeviceType
 from flexkv.common.storage import KVCacheLayout
 from flexkv.storage.storage_engine import StorageEngine
 from flexkv.transfer.transfer_engine import TransferEngine
+from flexkv.transfer.local_gdr import LocalGdrQuarantined
 from flexkv.server.utils import get_zmq_socket
 from flexkv.server.request import RegistrationKey, RegisterTPClientRequest, Response
 import contextlib
@@ -1063,7 +1064,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         self.command_parent_conn, self.command_child_conn = self.mp_ctx.Pipe()
         self.result_parent_conn, self.result_child_conn = self.mp_ctx.Pipe()
         self.error_parent_conn, self.error_child_conn = self.mp_ctx.Pipe(duplex=False)
-        self._worker_error: Optional[str] = None
+        self._worker_error: Optional[Union[str, bytes, LocalGdrQuarantined]] = None
+        self._worker_health_lock = threading.Lock()
 
         self.process: Optional[Process] = None
         self.start_event = self.mp_ctx.Event()
@@ -1224,7 +1226,11 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                             completed_queue = transfer_manager.transfer_engine.completed_queue
                             while not completed_queue.empty():
                                 try:
-                                    finished_ops.append(completed_queue.get_nowait())
+                                    result = completed_queue.get_nowait()
+                                    if isinstance(result, LocalGdrQuarantined):
+                                        error_conn.send(result)
+                                        break
+                                    finished_ops.append(result)
                                 except queue.Empty:
                                     break
 
@@ -1281,9 +1287,12 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         exited = self.process is not None and not self.process.is_alive()
         if exited:
             self.process.join()
-        if self._worker_error is None and self.error_parent_conn.poll():
-            with contextlib.suppress(EOFError):
-                self._worker_error = self.error_parent_conn.recv()
+        with self._worker_health_lock:
+            if self._worker_error is None and self.error_parent_conn.poll():
+                with contextlib.suppress(EOFError):
+                    self._worker_error = self.error_parent_conn.recv()
+        if isinstance(self._worker_error, LocalGdrQuarantined):
+            raise LocalGdrQuarantined(str(self._worker_error))
         if self._worker_error is not None:
             raise RuntimeError(f"TransferManager worker failed:\n{self._worker_error}")
         if exited:

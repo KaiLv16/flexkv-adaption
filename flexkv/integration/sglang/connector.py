@@ -534,9 +534,11 @@ class FlexKVConnector:
         )
         self.layer_done_counter: Optional[FlexKVLayerDoneCounter] = None
         if self.enable_layerwise:
+            gdr_owner = getattr(self.tp_client, "_local_gdr_owner", None)
             self.layer_done_counter = FlexKVLayerDoneCounter(
                 self.rank_info.num_layers_per_pp_stage,
                 world_rank=world_rank,
+                check_health=gdr_owner.check_healthy if gdr_owner is not None else None,
             )
             self._send_eventfds_to_worker()
         self._layerwise_generation = 0
