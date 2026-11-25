@@ -3,7 +3,6 @@
 import importlib.util
 import socket
 import sys
-import tempfile
 import threading
 import types
 import unittest
@@ -54,7 +53,8 @@ class LocalGdrLeaseTest(unittest.TestCase):
     def test_producer_visibility_and_explicit_drain(self):
         owner, caller, thread = self.start_lease()
         caller.sendall(b"CRVVD")
-        self.assertEqual(caller.makefile("rb").read(5), b"AAAAA")
+        with caller.makefile("rb") as stream:
+            self.assertEqual(stream.read(5), b"AAAAA")
         thread.join(1)
         self.assertFalse(thread.is_alive())
         self.native.gdr_producer_ready.assert_called_once_with(3)

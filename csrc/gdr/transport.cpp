@@ -222,10 +222,14 @@ Transport::Transport(int device, bool sender, const std::string &nic,
   auto &e = *p_;
   e.sender = sender;
   require(cudaSetDevice(device) == cudaSuccess, "cudaSetDevice failed");
-  // Match the reference backend: initialize fork handling before opening
-  // verbs resources or registering memory, once per process.
+  // Workers spawn a fresh interpreter. An Owner may already have live MRs
+  // from another transport, in which case fork protection cannot be enabled
+  // retroactively. The local GDR session never uses inherited verbs objects.
   static std::once_flag fork_once;
-  std::call_once(fork_once,[] { require(ibv_fork_init() == 0, "ibv_fork_init failed"); });
+  std::call_once(fork_once, [] {
+    const int result = ibv_fork_init();
+    require(result == 0 || result == EINVAL, "ibv_fork_init failed");
+  });
   int n=0;ibv_device **raw=ibv_get_device_list(&n);
   std::unique_ptr<ibv_device*,decltype(&ibv_free_device_list)> list(raw,ibv_free_device_list);
   require(raw && n,"no verbs devices; check rdma-core providers and /dev/infiniband");
