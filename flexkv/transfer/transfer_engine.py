@@ -62,6 +62,12 @@ from flexkv.common.config import (
 from flexkv.common.ring_buffer import SharedOpPool
 
 
+def _worker_ipc_handles(handles: list, *, h2d: bool) -> list:
+    if h2d:
+        return [getattr(handle, "h2d_peer", None) or handle for handle in handles]
+    return handles
+
+
 def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
     """
     Register transfer operation to buffer with device type prefixes.
@@ -257,7 +263,8 @@ class TransferEngine:
                 self._gpu_layouts_per_group)
 
     def _get_multi_group_kwargs(self, worker_key: WorkerKey, *,
-                                pool_id: PoolId = PoolId.FULL_KV) -> dict:
+                                pool_id: PoolId = PoolId.FULL_KV,
+                                h2d: bool = False) -> dict:
         """Multi-group handles/layouts for one worker, or {} if not applicable.
 
         Transposes the registry's [device][group] into the [group][device] a
@@ -283,7 +290,8 @@ class TransferEngine:
         return dict(
             layer_groups=layer_groups,
             gpu_blocks_per_group=[
-                [per_device_blocks[di][gi] for di in range(num_devices)]
+                [_worker_ipc_handles(per_device_blocks[di][gi], h2d=h2d)
+                 for di in range(num_devices)]
                 for gi in range(num_groups)
             ],
             gpu_layouts_per_group=[
@@ -292,7 +300,7 @@ class TransferEngine:
             ],
         )
 
-    def _get_swa_kwargs(self, worker_key: WorkerKey) -> dict:
+    def _get_swa_kwargs(self, worker_key: WorkerKey, *, h2d: bool = False) -> dict:
         """SWA pool args, for any worker that carries SWA as a second pool.
 
         Both ``GPUCPUTransferWorker`` and ``LayerwiseTransferWorker`` take SWA
@@ -309,7 +317,7 @@ class TransferEngine:
         # given both cannot tell which description of the same pool is
         # authoritative, and LayerwiseWorker rejects the pair outright.
         if self._swa_layer_groups is not None:
-            mg = self._get_multi_group_kwargs(worker_key, pool_id=PoolId.SWA)
+            mg = self._get_multi_group_kwargs(worker_key, pool_id=PoolId.SWA, h2d=h2d)
             if not mg:
                 return {}
             return dict(
@@ -323,7 +331,7 @@ class TransferEngine:
 
         return dict(
             swa_gpu_blocks=[
-                h.get_tensor_handle_list()
+                _worker_ipc_handles(h.get_tensor_handle_list(), h2d=h2d)
                 for h in self._swa_gpu_handles[worker_key]
             ],
             swa_cpu_blocks=self._swa_cpu_handle.get_worker_tensor(),
@@ -357,6 +365,7 @@ class TransferEngine:
         assert self._cpu_handle is not None
         from flexkv.transfer.local_gdr import enabled
 
+        h2d = local_direction == "h2d"
         local_gdr = local_direction is not None and enabled(local_direction)
         if local_gdr and self._local_gdr_stop is None:
             self._local_gdr_stop = self.mp_ctx.Event()
@@ -364,7 +373,8 @@ class TransferEngine:
             mp_ctx=self.mp_ctx,
             finished_ops_queue=self.finished_ops_queue,
             op_buffer_tensor=self.pin_buffer.get_buffer(),
-            gpu_blocks=[h.get_tensor_handle_list() for h in gpu_handles],
+            gpu_blocks=[_worker_ipc_handles(h.get_tensor_handle_list(), h2d=h2d)
+                        for h in gpu_handles],
             cpu_blocks=self._cpu_handle.get_worker_tensor(),
             gpu_kv_layouts=[h.kv_layout for h in gpu_handles],
             cpu_kv_layout=self._cpu_handle.kv_layout,
@@ -379,8 +389,8 @@ class TransferEngine:
             completion=completion,
             layerwise_eventfd_socket=layerwise_eventfd_socket,
             local_gdr_stop=self._local_gdr_stop if local_gdr else None,
-            **self._get_multi_group_kwargs(worker_key),
-            **self._get_swa_kwargs(worker_key),
+            **self._get_multi_group_kwargs(worker_key, h2d=h2d),
+            **self._get_swa_kwargs(worker_key, h2d=h2d),
         )
         if local_gdr:
             self._local_gdr_workers.add(worker)
@@ -1664,7 +1674,9 @@ class TransferEngine:
             # for every TP width.
             payload = [handle.get_tensor_handle_list() for handle in handles]
             imported += int(
-                self.h2d_workers[worker_key].control("resume_gpu", payload)
+                self.h2d_workers[worker_key].control(
+                    "resume_gpu", [_worker_ipc_handles(group, h2d=True) for group in payload]
+                )
             )
             imported += int(
                 self.d2h_workers[worker_key].control("resume_gpu", payload)

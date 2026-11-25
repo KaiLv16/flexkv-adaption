@@ -1,4 +1,4 @@
-"""CPU-only regression tests for device identity in the CE-only profile."""
+"""CPU-only regression tests for CUDA IPC in the CE-only profile."""
 
 import ctypes
 import importlib
@@ -8,7 +8,7 @@ import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 
 class Device:
@@ -83,6 +83,21 @@ class CeOnlyIpcTest(unittest.TestCase):
         handle.rebuild_args = ()
         with self.assertRaisesRegex(RuntimeError, "CUDA IPC rebuilt on"):
             handle.get_tensor()
+
+    def test_host_workers_export_independent_refcounts(self):
+        counters = {1: 1, 2: 1}
+
+        def rebuild(storage_device, ticket):
+            counters[ticket] -= 1
+            return Tensor(Device("cuda", storage_device))
+
+        self.reductions.reduce_tensor = Mock(side_effect=[(rebuild, (0, 1)), (rebuild, (0, 2))])
+        tensor = Tensor(Device("cuda", 0))
+        with patch.dict(os.environ, {"FLEXKV_ENABLE_CE_ONLY": "1"}):
+            handle = self.handles.TensorSharedHandle.for_host_workers(tensor, 0)
+        self.reductions.reduce_tensor.assert_has_calls([call(tensor), call(tensor)])
+        self.assertEqual(handle.get_tensor().device, handle.h2d_peer.get_tensor().device)
+        self.assertEqual(counters, {1: 0, 2: 0})
 
 
 if __name__ == "__main__":

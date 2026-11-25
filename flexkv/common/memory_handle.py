@@ -2,7 +2,7 @@ import multiprocessing as mp
 import os
 import time
 from typing import Callable, Any, Optional, Tuple, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import ctypes
 
 import torch
@@ -541,6 +541,15 @@ class TensorSharedHandle:
     handle_type: str = "torch_reduce"
     vmm_allocation_size: int = 0
     vmm_granularity: int = 0
+    h2d_peer: Optional["TensorSharedHandle"] = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def for_host_workers(cls, tensor: torch.Tensor, device_id: int) -> "TensorSharedHandle":
+        handle = cls(tensor, device_id)
+        if ce_only_enabled():
+            # Each worker import consumes a Torch IPC reference counter.
+            handle.h2d_peer = cls(tensor, device_id)
+        return handle
 
     def __init__(
         self,

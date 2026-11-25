@@ -490,10 +490,8 @@ class KVTPClient:
         # Use override_device_id if provided, otherwise use self.device_id
         device_id = override_device_id if override_device_id is not None else self.device_id
 
-        handles = []
-        for _, tensor in enumerate(kv_caches):
-            handle = TensorSharedHandle(tensor, device_id)
-            handles.append(handle)
+        export = TensorSharedHandle.for_host_workers
+        handles = [export(tensor, device_id) for tensor in kv_caches]
 
         # Build per-group shared handles when multi-group registration is requested
         # (heterogeneous KV layouts, including DSA/NSA indexer-as-group).
@@ -501,7 +499,7 @@ class KVTPClient:
         if handles_per_group is not None:
             handles_per_group_shared = []
             for group_tensors in handles_per_group:
-                group_handles = [TensorSharedHandle(t, device_id) for t in group_tensors]
+                group_handles = [export(t, device_id) for t in group_tensors]
                 handles_per_group_shared.append(group_handles)
 
         # SWA dedicated pool handles (channel B): build CUDA IPC handles for
@@ -511,7 +509,9 @@ class KVTPClient:
         if swa_caches is not None and len(swa_caches) > 0:
             if not swa_caches[0].is_cuda:
                 raise ValueError("SWA blocks must be CUDA tensors")
-            swa_handles_shared = [TensorSharedHandle(t, device_id) for t in swa_caches]
+            # Grouped SWA workers import the group handles below.
+            swa_export = export if swa_layer_groups is None else TensorSharedHandle
+            swa_handles_shared = [swa_export(t, device_id) for t in swa_caches]
 
         swa_handles_per_group_shared: Optional[
             List[List[TensorSharedHandle]]
@@ -522,7 +522,7 @@ class KVTPClient:
                 if not group_tensors or not group_tensors[0].is_cuda:
                     raise ValueError("SWA group blocks must be non-empty CUDA tensors")
                 swa_handles_per_group_shared.append(
-                    [TensorSharedHandle(t, device_id) for t in group_tensors]
+                    [export(t, device_id) for t in group_tensors]
                 )
 
         if os.environ.get("FLEXKV_LOCAL_GDR", "off") != "off":
@@ -540,6 +540,9 @@ class KVTPClient:
                                            swa_handles_per_group_shared or [], strict=True):
                     pairs.extend(zip(tensors, shared, strict=True))
                 local_gdr.export_views(self, pairs)
+                for _, handle in pairs:
+                    if handle.h2d_peer is not None:
+                        handle.h2d_peer.local_gdr_view = handle.local_gdr_view
 
         register_req = RegisterTPClientRequest(
             dp_client_id=self.dp_client_id,
