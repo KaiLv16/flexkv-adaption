@@ -4,6 +4,9 @@
  */
 #include "region_batch.h"
 
+#ifdef FLEXKV_ENABLE_GDR
+#include "gdr/region_adapter.h"
+#endif
 #include "logging.h"
 #include <algorithm>
 #include <c10/cuda/CUDAFunctions.h>
@@ -354,11 +357,20 @@ RegionBatchGroup::prepare(const std::vector<RegionRequest> &requests_in,
 
 void RegionBatchGroup::submit(const std::vector<RegionRequest> &requests_in,
                               bool sync) {
+#ifdef FLEXKV_ENABLE_GDR
+  gdr_whole_completed_ = false;
+#endif
   if (requests_in.empty()) {
     return;
   }
   std::vector<RegionRequest> scratch;
   const std::vector<RegionRequest> *requests = &prepare(requests_in, scratch);
+#ifdef FLEXKV_ENABLE_GDR
+  if (try_gdr(*requests, nullptr, 0)) {
+    gdr_whole_completed_ = true;
+    return;
+  }
+#endif
 
   // One fan-out for the whole batch. Each rank walks the request list in
   // order, launching onto its own stream; nothing joins in between, so
@@ -397,6 +409,18 @@ void RegionBatchGroup::set_layer_eventfds(const torch::Tensor &fds_tensor,
 void RegionBatchGroup::submit_layerwise(
     const std::vector<RegionRequest> &requests_in,
     const std::vector<int> &empty_layers, int counter_id) {
+#ifdef FLEXKV_ENABLE_GDR
+  gdr_layerwise_completed_ = false;
+  if (gdr_ && gdr_->ready() && !requests_in.empty() &&
+      std::all_of(requests_in.begin(), requests_in.end(), [](const RegionRequest &req) {
+        return req.is_host_to_device && req.backend == TransferBackendKind::AUTO;
+      })) {
+    std::vector<RegionRequest> scratch;
+    const auto &requests = prepare(requests_in, scratch);
+    gdr_layerwise_completed_ = try_gdr(requests, &empty_layers, counter_id);
+    return;
+  }
+#endif
   notifier_.reset(layer_notify_mode_, device_ids_, counter_id);
 
   // A layer with no state in this model still has a consumer waiting on its
@@ -471,6 +495,9 @@ void RegionBatchGroup::submit_layerwise(
 
 bool RegionBatchGroup::wait_layer_completion(double timeout_s,
                                              std::string *error_out) {
+#ifdef FLEXKV_ENABLE_GDR
+  if (gdr_layerwise_completed_) return true;
+#endif
   if (!notifier_.wait(timeout_s, error_out)) {
     return false;
   }
@@ -488,10 +515,21 @@ bool RegionBatchGroup::wait_layer_completion(double timeout_s,
   return true;
 }
 
-void RegionBatchGroup::wait_all_streams() { pool_->sync_all_streams(); }
+void RegionBatchGroup::wait_all_streams() {
+#ifdef FLEXKV_ENABLE_GDR
+  if (gdr_whole_completed_) {
+    gdr_whole_completed_ = false;
+    return;
+  }
+#endif
+  pool_->sync_all_streams();
+}
 
 void RegionBatchGroup::update_region_gpu_ptrs(
     int region_index, const std::vector<int64_t> &gpu_block_ptrs_flat) {
+#ifdef FLEXKV_ENABLE_GDR
+  if (gdr_) throw std::logic_error("GDR: close routes before changing the registered allocation");
+#endif
   if (region_index < 0 || region_index >= num_regions()) {
     throw std::out_of_range("region_index out of range");
   }

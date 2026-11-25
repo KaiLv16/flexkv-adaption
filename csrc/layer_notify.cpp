@@ -7,6 +7,7 @@
 #include "logging.h"
 
 #include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <stdexcept>
 #include <unistd.h>
@@ -57,6 +58,26 @@ void LayerEventfdTable::post(int counter_id, int layer) const {
     }
   }
 }
+
+#ifdef FLEXKV_ENABLE_GDR
+void LayerEventfdTable::post_checked(int counter_id, int layer) const {
+  if (!enabled_ || counter_id < 0 || counter_id >= num_counters_ ||
+      layer < 0 || layer >= num_layers_)
+    throw std::invalid_argument("GDR: invalid eventfd milestone");
+  const int *base = fds_.data() + counter_id * tp_size_ * num_layers_;
+  for (int rank = 0; rank < tp_size_; ++rank) {
+    const int fd = base[rank * num_layers_ + layer];
+    if (fd < 0) continue;
+    const uint64_t value = 1;
+    ssize_t count;
+    do {
+      count = write(fd, &value, sizeof(value));
+    } while (count < 0 && errno == EINTR);
+    if (count != sizeof(value))
+      throw std::runtime_error("GDR: failed to publish layer eventfd");
+  }
+}
+#endif
 
 namespace {
 

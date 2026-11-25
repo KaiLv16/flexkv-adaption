@@ -1,6 +1,7 @@
 import importlib.metadata
 import importlib.util
 import os
+import sys
 import shutil
 from pathlib import Path
 from typing import NamedTuple
@@ -372,6 +373,20 @@ extra_compile_args = [
 ]
 if enable_metrics:
     extra_compile_args.append("-DFLEXKV_ENABLE_MONITORING")
+enable_gdr = os.environ.get("FLEXKV_ENABLE_GDR", "0") == "1"
+if enable_gdr:
+    if sys.platform != "linux" or enable_cputest:
+        raise RuntimeError("FLEXKV_ENABLE_GDR requires a Linux device build")
+    gdr_backend = os.environ.get("FLEXKV_GDR_BACKEND", "native")
+    if gdr_backend not in {"native", "mapped"}:
+        raise ValueError("FLEXKV_GDR_BACKEND must be native or mapped")
+    cpp_sources.extend(["csrc/gdr/transport.cpp", "csrc/gdr/region_adapter.cpp"])
+    hpp_sources.extend(["csrc/gdr/bindings.h", "csrc/gdr/transport.h", "csrc/gdr/region_adapter.h",
+                        "csrc/gdr/topology.h"])
+    extra_compile_args.append("-DFLEXKV_ENABLE_GDR")
+    if gdr_backend == "mapped":
+        extra_compile_args.append("-DFLEXKV_GDR_MAPPED")
+    extra_link_args.append("-libverbs")
 include_dirs = [
     os.path.abspath(os.path.join(build_dir, "include")),
     os.path.abspath("csrc"),

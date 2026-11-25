@@ -6,6 +6,8 @@ worker each; ``op.pool_id`` selects which. Layerwise (per-layer eventfd)
 delivery is a completion contract on this worker, not a separate class.
 """
 
+import os
+import threading
 import time
 from dataclasses import dataclass, field
 from itertools import groupby
@@ -41,7 +43,7 @@ from flexkv.transfer.region_batch import (
     region_batch_available,
 )
 from flexkv.transfer.template import compile_gpu_regions, compile_host_regions
-from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp, WorkerTransferOp
+from flexkv.transfer.worker_op import UnsafeWorkerTransfer, WorkerLayerwiseTransferOp, WorkerTransferOp
 from flexkv.transfer.workers.runtime import TransferWorkerBase
 
 # Stand-in for the block ids of a cached layerwise request, which are rebound
@@ -216,9 +218,13 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                  # never opens the UDS and never records a marker.
                  completion: Union[str, CompletionContract, None] = None,
                  layerwise_eventfd_socket: Optional[str] = None,
+                 local_gdr_stop: Any = None,
                  h2d_layer_holders: Optional[Tuple[int, ...]] = None):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+        self._local_gdr_stop = local_gdr_stop
+        self._local_gdr_views = [] if local_gdr_stop is not None else None
+        self._local_gdr_leases = []
         assert len(gpu_blocks) == tp_group_size
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         if completion is None:
@@ -383,6 +389,76 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         self._init_completion(completion, layerwise_eventfd_socket,
                               tp_group_size)
         self._compressor.attach(self)
+        if local_gdr_stop is not None:
+            self._attach_local_gdr()
+
+    def _import_tensor_handles(self, handles):
+        tensors = super()._import_tensor_handles(handles)
+        if getattr(self, "_local_gdr_views", None) is not None:
+            from flexkv.transfer.local_gdr import import_views
+
+            import_views(handles, tensors)
+            self._local_gdr_views.extend(tensors)
+        return tensors
+
+    def _attach_local_gdr(self):
+        from flexkv.transfer.local_gdr import attach_routes
+
+        if not self._use_region_batch() or self._compressor.needs_gpu_cpu_thread_group:
+            raise RuntimeError("Local GDR requires uncompressed RegionBatch transfers")
+        if self._completion.needs_eventfd and not self.region_batch.layer_notification_enabled:
+            raise RuntimeError("Local GDR layerwise transfer requires consumer eventfds")
+        hosts = [self.cpu_tensor]
+        if hasattr(self, "swa_cpu_tensor"):
+            hosts.append(self.swa_cpu_tensor)
+        self._local_gdr_leases = attach_routes(
+            self.region_batch, self._device_ids, self._local_gdr_views, hosts)
+        threading.Thread(target=self._watch_gdr_stop, daemon=True,
+                         name="flexkv-gdr-stop").start()
+
+    def _watch_gdr_stop(self):
+        self._local_gdr_stop.wait()
+        self._mark_gdr_quarantined()
+
+    def _mark_gdr_quarantined(self):
+        from flexkv.transfer.local_gdr import quarantine
+
+        self._local_gdr_quarantined = True
+        self.region_batch.stop_gdr()
+        quarantine(self._local_gdr_leases)
+
+    def shutdown(self):
+        if getattr(self, "_local_gdr_quarantined", False):
+            return
+        leases = getattr(self, "_local_gdr_leases", None)
+        if leases:
+            from flexkv.transfer.local_gdr import close_routes
+
+            if os.environ.get("FLEXKV_GDR_LOG_COUNTERS") == "1":
+                flexkv_logger.info("Local GDR route counters (H2D bytes, D2H bytes, "
+                                   "payload WRs, posts, CQEs, read-backs): %s",
+                                   self.region_batch.gdr_counters())
+            close_routes(self.region_batch, leases)
+            leases.clear()
+            self._local_gdr_views.clear()
+        super().shutdown()
+
+    def _submit_region_batch(self, launch, *args):
+        if not getattr(self, "_local_gdr_leases", None):
+            return launch(*args)
+        from flexkv.c_ext import UnsafeGdrTransfer
+
+        try:
+            if self._local_gdr_stop.is_set():
+                raise UnsafeGdrTransfer("Local GDR was stopped by the transfer manager")
+            result = launch(*args)
+            if self._local_gdr_stop.is_set():
+                raise UnsafeGdrTransfer("Local GDR stopped before publishing transfer completion")
+            return result
+        except UnsafeGdrTransfer as exc:
+            self._local_gdr_stop.set()
+            self._mark_gdr_quarantined()
+            raise UnsafeWorkerTransfer(str(exc)) from exc
 
     def _init_cp_routes(self, main_pool: "_Pool") -> None:
         self._cp_ranges = []
@@ -554,6 +630,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             num_layers=num_layers,
             kv_dim=kv_dim,
             num_kv_heads=num_kv_heads,
+            cpu_num_blocks=cpu_kv_layout.num_block,
+            gpu_num_blocks=[layout.num_block for layout in gpu_kv_layouts],
         ))
         pool.thread_group_thunks.append(lambda: {
             'tp_thread_group': build_thread_group(),
@@ -943,6 +1021,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 gpu_chunk_sizes=gpu_chunk_sizes,
                 num_layers=g.num_layers,
                 kv_dim=self.kv_dim,
+                cpu_num_blocks=cpu_kv_layout.num_block,
+                gpu_num_blocks=[layout.num_block for layout in group_gpu_layouts],
                 # Pool-wide, not g.num_kv_heads -- this is an *addressing mode*
                 # selector, not a shape. >1 means "each rank owns a private
                 # stretch at rank*cpu_tp_stride"; ==1 means "every rank holds
@@ -1196,7 +1276,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 requests = make_requests(
                     *block_args, **request_args, share_mode=self._rank_share_mode,
                     region_indices=pool.region_indices)
-            self.region_batch.submit(requests, launch_sync)
+            self._submit_region_batch(self.region_batch.submit, requests, launch_sync)
             if self._use_async_launch:
                 self.region_batch.wait_all_streams()
         elif self._is_per_group(pool):
@@ -1377,8 +1457,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         if not requests and not empty_layers:
             return
 
-        self.region_batch.submit_layerwise(
-            requests, empty_layers, counter_id)
+        self._submit_region_batch(
+            self.region_batch.submit_layerwise, requests, empty_layers, counter_id)
         # Launched, not landed. Returning here would let the engine recycle the
         # source blocks while DMA is still reading them -- and we cannot drain
         # inline before the posts, because the consumer is blocked on the very

@@ -398,6 +398,8 @@ class KVTPClient:
             )
 
     def suspend_gpu_mappings(self) -> int:
+        if getattr(self, "_local_gdr_owner", None) is not None:
+            raise RuntimeError("Local GDR requires a new session before GPU remap")
         request = {
             "type": "suspend_gpu",
             "registration_key": (self.dp_client_id, self.intra_client_id),
@@ -522,6 +524,22 @@ class KVTPClient:
                 swa_handles_per_group_shared.append(
                     [TensorSharedHandle(t, device_id) for t in group_tensors]
                 )
+
+        if os.environ.get("FLEXKV_LOCAL_GDR", "off") != "off":
+            from flexkv.transfer import local_gdr
+
+            if local_gdr.enabled():
+                if resume or getattr(self, "_local_gdr_owner", None) is not None:
+                    raise RuntimeError("Local GDR requires a new session before GPU remap")
+                pairs = list(zip(kv_caches, handles, strict=True))
+                for tensors, shared in zip(handles_per_group or [],
+                                           handles_per_group_shared or [], strict=True):
+                    pairs.extend(zip(tensors, shared, strict=True))
+                pairs.extend(zip(swa_caches or [], swa_handles_shared or [], strict=True))
+                for tensors, shared in zip(swa_handles_per_group or [],
+                                           swa_handles_per_group_shared or [], strict=True):
+                    pairs.extend(zip(tensors, shared, strict=True))
+                local_gdr.export_views(self, pairs)
 
         register_req = RegisterTPClientRequest(
             dp_client_id=self.dp_client_id,

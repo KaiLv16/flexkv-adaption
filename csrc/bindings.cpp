@@ -26,6 +26,9 @@
 #include "pcfs/pcfs.h"
 #include "radix_tree.h"
 #include "region_batch.h"
+#ifdef FLEXKV_ENABLE_GDR
+#include "gdr/bindings.h"
+#endif
 #include "tp_transfer_thread_group.h"
 #include "transfer.cuh"
 #include "transfer_backend.h"
@@ -663,7 +666,8 @@ PYBIND11_MODULE(c_ext, m) {
       .value("NIXL", flexkv::TransferBackendKind::NIXL)
       .value("MOONCAKE", flexkv::TransferBackendKind::MOONCAKE);
 
-  py::class_<flexkv::RegionDesc>(m, "RegionDesc")
+  auto region_desc = py::class_<flexkv::RegionDesc>(m, "RegionDesc");
+  region_desc
       .def(py::init<>())
       .def_readwrite("name", &flexkv::RegionDesc::name)
       .def_readwrite("cpu_ptr", &flexkv::RegionDesc::cpu_ptr)
@@ -690,6 +694,10 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readwrite("num_layers", &flexkv::RegionDesc::num_layers)
       .def_readwrite("kv_dim", &flexkv::RegionDesc::kv_dim)
       .def_readwrite("num_kv_heads", &flexkv::RegionDesc::num_kv_heads);
+#ifdef FLEXKV_ENABLE_GDR
+  region_desc.def_readwrite("cpu_num_blocks", &flexkv::RegionDesc::cpu_num_blocks)
+      .def_readwrite("gpu_num_blocks", &flexkv::RegionDesc::gpu_num_blocks);
+#endif
 
   py::enum_<flexkv::RankShareMode>(m, "RankShareMode")
       .value("SHARDED", flexkv::RankShareMode::SHARDED)
@@ -729,7 +737,8 @@ PYBIND11_MODULE(c_ext, m) {
       .def_readwrite("milestone_layer",
                      &flexkv::RegionRequest::milestone_layer);
 
-  py::class_<flexkv::RegionBatchGroup>(m, "RegionBatchGroup")
+  auto region_batch = py::class_<flexkv::RegionBatchGroup>(m, "RegionBatchGroup");
+  region_batch
       .def(py::init([](const std::vector<int64_t> &gpu_device_ids,
                        const std::vector<flexkv::RegionDesc> &regions,
                        int64_t ce_segment_threshold, bool ce_path_opt,
@@ -796,6 +805,9 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("region_index"), py::arg("gpu_block_ptrs_flat"),
            py::call_guard<py::gil_scoped_release>());
 
+#ifdef FLEXKV_ENABLE_GDR
+  flexkv::gdr::bind(m, region_batch);
+#endif
 #ifdef FLEXKV_ENABLE_GDS
   py::class_<flexkv::TPGDSTransferThreadGroup>(m, "TPGDSTransferThreadGroup")
       .def(py::init<int, const std::vector<int64_t> &, int,

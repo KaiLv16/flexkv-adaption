@@ -1848,6 +1848,12 @@ class FlexKVConnector:
                 kv_indices = kv_indices[:aligned_len]
                 n = aligned_len
 
+        owner = getattr(getattr(self, "tp_client", None), "_local_gdr_owner", None)
+        if owner is not None and owner.d2h_enabled and self._sync_ctx.needs_sync:
+            # Every producer must have submitted its local KV writes before
+            # the leader starts the graph and the Worker asks Owners to fence.
+            self._sync_ctx.barrier()
+
         store_start = {
             "rid": rid,
             "task_id": -1,
@@ -2680,6 +2686,9 @@ class FlexKVConnector:
         if getattr(self, "_shutdown_done", False):
             return
         self._shutdown_done = True
+        gdr_owner = getattr(getattr(self, "tp_client", None), "_local_gdr_owner", None)
+        if gdr_owner is not None:
+            gdr_owner.retire()
         # print+flush: survives abrupt exit better than logger buffering into | tee.
         logger.info("[FlexKV] connector shutdown begin %s", self._label)
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:

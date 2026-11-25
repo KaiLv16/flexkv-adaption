@@ -42,7 +42,9 @@ from flexkv.transfer.host_buffer import (
     safe_cuda_host_unregister,
 )
 from flexkv.transfer.template import gpu_strides_from_tensor
-from flexkv.transfer.worker_op import WorkerTransferOp, WorkerTransferResult
+from flexkv.transfer.worker_op import (
+    UnsafeWorkerTransfer, WorkerTransferIncident, WorkerTransferOp, WorkerTransferResult,
+)
 from flexkv.transfer.workers.handle import WorkerHandle
 
 
@@ -324,9 +326,11 @@ class TransferWorkerBase(ABC):
         )
         process.start()
 
+        local_gdr = kwargs.get("local_gdr_stop") is not None
         return WorkerHandle(
             worker_id, parent_conn, process, ready_event, finished_ops_queue,
-            isolate_remote=bool(getattr(cls, "_is_remote_worker", False)),
+            isolate_remote=bool(getattr(cls, "_is_remote_worker", False)) or local_gdr,
+            retain_on_timeout=local_gdr,
         )
 
     @classmethod
@@ -702,6 +706,13 @@ class TransferWorkerBase(ABC):
                             transfer_status, transfer_start_ns, _ = batch_results[op.transfer_op_id]
                         else:
                             transfer_status = self.launch_transfer(op)
+                    except UnsafeWorkerTransfer as exc:
+                        self.finished_ops_queue.put(WorkerTransferIncident(
+                            self.worker_id, op.transfer_op_id, str(exc)))
+                        # Keep the process, buffers and endpoints alive. Generic
+                        # shutdown/unregister cannot prove foreign DMA stopped.
+                        threading.Event().wait()
+                        return
                     except Exception as e:
                         is_layerwise = op.transfer_type == TransferType.LAYERWISE
                         direction = "H2D" if is_layerwise else op.transfer_type.value

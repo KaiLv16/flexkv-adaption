@@ -7,6 +7,17 @@ from flexkv.common.pool import PoolId
 from flexkv.common.transfer import TransferOp, TransferType, LayerwiseTransferOp
 
 
+class UnsafeWorkerTransfer(RuntimeError):
+    """An external engine may still access this worker's registered pools."""
+
+
+@dataclass(frozen=True)
+class WorkerTransferIncident:
+    worker_id: int
+    op_id: int
+    reason: str
+
+
 @dataclass(frozen=True)
 class WorkerTransferResult:
     """Worker-to-scheduler completion with optional per-block outcomes."""

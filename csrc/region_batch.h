@@ -45,6 +45,13 @@
 
 namespace flexkv {
 
+#ifdef FLEXKV_ENABLE_GDR
+namespace gdr {
+class RegionAdapter;
+class Transport;
+struct RegionWork;
+}
+#endif
 // Static geometry of one region.  Registered once at construction; nothing
 // here changes between transfers.
 struct RegionDesc {
@@ -69,6 +76,10 @@ struct RegionDesc {
   int num_layers = 0; // layers *in this region*, not in the model
   int kv_dim = 1;
   int num_kv_heads = 1;
+#ifdef FLEXKV_ENABLE_GDR
+  int64_t cpu_num_blocks = 0;
+  std::vector<int64_t> gpu_num_blocks;
+#endif
 };
 
 // How the ranks of a TP group divide up a *rank-shared* region -- one where
@@ -184,12 +195,26 @@ public:
 
   void wait_all_streams();
 
+#ifdef FLEXKV_ENABLE_GDR
+  void install_gdr_route(int rank, std::unique_ptr<gdr::Transport> sender, int fd);
+  void close_gdr();
+  void stop_gdr() { gdr_stopped_.store(true, std::memory_order_release); }
+  std::vector<std::vector<uint64_t>> gdr_counters() const;
+#endif
   // Re-point one region's device tensors after a GPU hot remap.  Drains
   // first: the old pointers may still be in flight.
   void update_region_gpu_ptrs(int region_index,
                               const std::vector<int64_t> &gpu_block_ptrs_flat);
 
 private:
+#ifdef FLEXKV_ENABLE_GDR
+  std::unique_ptr<gdr::RegionAdapter> gdr_;
+  bool gdr_layerwise_completed_ = false;
+  bool gdr_whole_completed_ = false;
+  std::atomic<bool> gdr_stopped_{false};
+  bool try_gdr(const std::vector<RegionRequest> &requests,
+               const std::vector<int> *empty_layers, int counter_id);
+#endif
   // Per-region device-side state, resolved once at construction.
   struct RegionState {
     RegionDesc desc;

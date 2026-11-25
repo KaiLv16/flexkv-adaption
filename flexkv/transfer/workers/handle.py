@@ -27,7 +27,7 @@ class WorkerHandle:
     """handle for worker process"""
     def __init__(self, worker_id: int, transfer_conn: Connection, process: mp.Process,
                  ready_event: Any, finished_ops_queue: Any = None,
-                 isolate_remote: bool = False):
+                 isolate_remote: bool = False, retain_on_timeout: bool = False):
         self.worker_id = worker_id
         self.transfer_conn = transfer_conn
         self.process = process
@@ -47,6 +47,7 @@ class WorkerHandle:
         # concurrently, on the same object. See the note on shutdown().
         self._shutdown_lock = threading.Lock()
         self._shutdown_done = False
+        self._retain_on_timeout = retain_on_timeout
 
     def _fail_unsent(self, payload: Any, error: Exception) -> None:
         op_id = getattr(payload, "transfer_op_id", None)
@@ -131,6 +132,8 @@ class WorkerHandle:
             timeout = float(GLOBAL_CONFIG_FROM_ENV.worker_shutdown_timeout_s)
             self.process.join(timeout=timeout)
             if self.process.is_alive():
+                if self._retain_on_timeout:
+                    raise RuntimeError("Local GDR Worker did not drain; process retained")
                 flexkv_logger.warning(
                     f"[WorkerHandle] worker {self.worker_id} still alive after "
                     f"{timeout:.0f}s graceful shutdown; force terminate"

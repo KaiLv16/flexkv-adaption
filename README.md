@@ -126,6 +126,24 @@ apt install libhiredis-dev
 
 See the [SGLang integration guide](flexkv/integration/sglang/README.md).
 
+Local GDR is an opt-in Linux backend for same-host Host↔Device transfers on
+the RegionBatch path. Build with rdma-core development headers and
+`FLEXKV_ENABLE_GDR=1 FLEXKV_GDR_BACKEND=native ./build.sh`. Use
+`FLEXKV_GDR_BACKEND=mapped` when building against the P800 mapped runtime.
+Set `FLEXKV_LOCAL_GDR=h2d`, `d2h` or `both` in the serving environment.
+The default is `off`. An enabled direction requires a complete local Owner
+registration. `FLEXKV_GDR_NICS` can specify a comma-separated NIC per local
+rank when PCIe proximity is ambiguous. `FLEXKV_GDR_READBACKS` sets the maximum
+mapped H2D read-backs in flight per route (default 1). It must fit the negotiated
+READ depth, optionally requested through `FLEXKV_GDR_READ_DEPTH`.
+
+This backend needs platform acceptance before production use. Verify the
+actual model's merged layerwise restore, D2H, device ordering and isolation
+after a Worker or Owner failure. `FLEXKV_GDR_LOG_COUNTERS=1` reports per-route
+payload bytes, WRs, CQEs and read-backs on clean shutdown. A quarantined
+instance retains its registered buffers and requires platform isolation
+before teardown or restart.
+
 ### Use FlexKV with vLLM
 
 See [docs/vllm_adapter/README_en.md](docs/vllm_adapter/README_en.md)

@@ -64,6 +64,9 @@ public:
 
   // Post one semaphore token to every tp_rank's fd for ``layer``.
   void post(int counter_id, int layer) const;
+#ifdef FLEXKV_ENABLE_GDR
+  void post_checked(int counter_id, int layer) const;
+#endif
 
 private:
   bool enabled_ = false;

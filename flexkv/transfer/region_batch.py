@@ -60,6 +60,8 @@ class RegionSpec:
     num_layers: int
     kv_dim: int = 1
     num_kv_heads: int = 1
+    cpu_num_blocks: int = 0
+    gpu_num_blocks: List[int] = field(default_factory=list)
 
     def validate(self, num_ranks: int) -> None:
         """Raise on the mismatches C++ would otherwise report from a worker
@@ -97,6 +99,9 @@ class RegionSpec:
         d.num_layers = self.num_layers
         d.kv_dim = self.kv_dim
         d.num_kv_heads = self.num_kv_heads
+        if hasattr(d, "cpu_num_blocks"):
+            d.cpu_num_blocks = self.cpu_num_blocks
+            d.gpu_num_blocks = self.gpu_num_blocks
         return d
 
 
