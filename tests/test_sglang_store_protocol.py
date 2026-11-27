@@ -491,6 +491,35 @@ def test_validate_kv_pool_support_rejects_unsupported_layouts_and_k_only():
         connector._resolve_kv_buffers(SimpleNamespace(k_buffer=[torch.zeros(4)], v_buffer=None))
 
 
+def test_draft_store_marks_uncertainty_after_launch_attempt():
+    connector = _follower_connector(None)
+    connector._draft_regions = (object(),)
+    connector._sync_ctx.is_sync_leader = True
+    connector._sync_ctx.scatter.side_effect = lambda value, **_: value
+    connector._swa_kv_pool = None
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.put_match.return_value = (17, np.ones(4, dtype=np.bool_))
+    connector.kv_manager.launch.side_effect = OSError()
+
+    with pytest.raises(StoreSubmissionUncertainError, match="OSError"):
+        connector.store_kv("request", range(4), torch.arange(4))
+    assert connector._inflight_stores == {"request": 17}
+
+
+def test_draft_store_notification_failure_without_launch_has_no_task():
+    connector = _follower_connector(None)
+    connector._draft_regions = (object(),)
+    connector._sync_ctx.is_sync_leader = True
+    connector._sync_ctx.scatter.side_effect = OSError("start notification failed")
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.put_match.return_value = None
+
+    with pytest.raises(OSError, match="start notification failed"):
+        connector.store_kv("request", range(4), torch.arange(4))
+    assert not connector._inflight_stores
+    connector.kv_manager.launch.assert_not_called()
+
+
 def test_namespace_is_forwarded_to_lookup_store_and_prefetch():
     connector = _follower_connector(None)
     connector._sync_ctx.is_sync_leader = True

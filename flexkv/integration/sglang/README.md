@@ -191,6 +191,16 @@ appropriate cold baseline, exercise stop/abort and verify resources after drain.
 CPU tests alone do not establish GPU or real transport correctness. See
 [`tests/prefetch`](../../../tests/prefetch) for the available tests.
 
+## Optional speculative draft KV
+
+Set `FLEXKV_CACHE_DRAFT_KV=1` on every serving rank when using a matching SGLang adapter and a model-backed speculative worker. The default is `0`. The adapter passes the connector one draft KV pool or an ordered sequence of pools via `draft_kvcache`. Every pool must materialize the committed prefix at the target's slot IDs before the scheduler publishes it. Each draft layer may have its own width, dtype, and optional page-packed indexer. Separate K and V buffers are supported.
+
+The adapter also supplies `draft_key_format` and encodes lookup, write, and prefetch keys consistently. A causal draft uses `token`. A one-token input rotation uses `bigram` and retains the boundary token after the last slot. A cascaded worker that rotates inputs again needs a longer prefix key. The supplied adapters reject unsupported lookahead.
+
+Target and draft data share one Host block. FlexKV sizes the block from the registered tensors and includes the model, draft, key format, and layout in its storage namespace. In physical CP mode each rank stores its draft replica separately. A layerwise restore includes every draft region in target layer zero's completion notification.
+
+This path supports full-attention MLA or separate K/V pools with BLOCKFIRST Host storage, PP=1, and a local attention TP group or a physically layer-split DSA CP group. Hybrid DSv4/SWA, private draft slot rings, and external dynamic quantization state require additional adapter support.
+
 ## Optional Index-K deduplication
 
 For compatible DSA models, `FLEXKV_DEDUP_INDEXER_GROUP=1` registers only active

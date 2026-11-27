@@ -229,6 +229,8 @@ class FlexKVConnector:
 
     _chunked_namespace_supported = True
     _cache_layout_key = None
+    _draft_pools = ()
+    _draft_regions = ()
 
     def _cache_namespace(self, namespace):
         if self._cache_layout_key is None:
@@ -237,7 +239,7 @@ class FlexKVConnector:
 
     @property
     def _coordinated_restore(self) -> bool:
-        return False
+        return bool(self._draft_regions)
 
     @property
     def supports_cache_namespace(self) -> bool:
@@ -264,7 +266,12 @@ class FlexKVConnector:
         pp_group: Any = None,
         attn_tp_group: Any = None,
         attn_cp_group: Any = None,
+        draft_kvcache: Any = None,
+        draft_key_format: str = "token",
     ) -> None:
+        draft_enabled = os.environ.get("FLEXKV_CACHE_DRAFT_KV", "0") == "1"
+        if draft_kvcache is not None and not draft_enabled:
+            raise ValueError("Storing draft KV requires FLEXKV_CACHE_DRAFT_KV=1")
         self.page_size = int(page_size)
 
         # 1. Resolve FlexKV config from env + sglang server args.
@@ -367,54 +374,60 @@ class FlexKVConnector:
 
         pool = getattr(kvcache, "full_kv_pool", kvcache)
         self._validate_kv_pool_support(kvcache, pool, server_args)
-        kv_caches, indexer_group = self._resolve_kv_buffers(kvcache)
-        if (
-            not self._is_dsv4
-            and kv_caches
-            and kv_caches[0].ndim == 3
-            and self.model_config.kv_dim == 1
-            and self.model_config.num_kv_heads == 1
-        ):
-            sample_kv = kv_caches[0]
+        configured_groups = self.model_config.layer_groups
+        if draft_enabled:
+            kv_caches, indexer_group = self._resolve_draft_registration(
+                pool, draft_kvcache, server_args, configured_groups, draft_key_format
+            )
+        else:
+            kv_caches, indexer_group = self._resolve_kv_buffers(kvcache)
             if (
-                sample_kv.dtype != self.model_config.dtype
-                or sample_kv.shape[2] != self.model_config.head_size
+                not self._is_dsv4
+                and kv_caches
+                and kv_caches[0].ndim == 3
+                and self.model_config.kv_dim == 1
+                and self.model_config.num_kv_heads == 1
             ):
-                model_config = replace(
-                    self.model_config,
-                    dtype=sample_kv.dtype,
-                    head_size=sample_kv.shape[2],
-                )
-                model_config.freeze()
-                self.model_config = self.flexkv_config.model_config = model_config
-                self.rank_info = replace(self.rank_info, model_config=model_config)
-            storage_format_tag = getattr(pool, "storage_format_tag", None)
-            if storage_format_tag is not None and self._cache_layout_key is None:
-                indexer_desc = (
-                    (
-                        indexer_group.layer_indices,
-                        str(indexer_group.buffers[0].dtype),
-                        indexer_group.buffers[0].shape[1],
+                sample_kv = kv_caches[0]
+                if (
+                    sample_kv.dtype != self.model_config.dtype
+                    or sample_kv.shape[2] != self.model_config.head_size
+                ):
+                    model_config = replace(
+                        self.model_config,
+                        dtype=sample_kv.dtype,
+                        head_size=sample_kv.shape[2],
                     )
-                    if indexer_group is not None
-                    else None
-                )
-                format_layout = (
-                    self.model_config.num_layers,
-                    self.page_size,
-                    str(sample_kv.dtype),
-                    sample_kv.shape[2],
-                    storage_format_tag,
-                    indexer_desc,
-                    (
-                        getattr(server_args, "model_path", None),
-                        getattr(server_args, "revision", None),
-                    ),
-                )
-                digest = hashlib.sha256(
-                    json.dumps(format_layout, default=str).encode()
-                ).hexdigest()
-                self._cache_layout_key = f"flexkv.format.v1.{digest}"
+                    model_config.freeze()
+                    self.model_config = self.flexkv_config.model_config = model_config
+                    self.rank_info = replace(self.rank_info, model_config=model_config)
+                storage_format_tag = getattr(pool, "storage_format_tag", None)
+                if storage_format_tag is not None and self._cache_layout_key is None:
+                    indexer_desc = (
+                        (
+                            indexer_group.layer_indices,
+                            str(indexer_group.buffers[0].dtype),
+                            indexer_group.buffers[0].shape[1],
+                        )
+                        if indexer_group is not None
+                        else None
+                    )
+                    format_layout = (
+                        self.model_config.num_layers,
+                        self.page_size,
+                        str(sample_kv.dtype),
+                        sample_kv.shape[2],
+                        storage_format_tag,
+                        indexer_desc,
+                        (
+                            getattr(server_args, "model_path", None),
+                            getattr(server_args, "revision", None),
+                        ),
+                    )
+                    digest = hashlib.sha256(
+                        json.dumps(format_layout, default=str).encode()
+                    ).hexdigest()
+                    self._cache_layout_key = f"flexkv.format.v1.{digest}"
         if self._swa_kv_pool is not None and self.cache_config.swa is not None:
             buffers = self._swa_kv_pool.kv_buffer
             snapshot_bytes = sum(
@@ -2089,6 +2102,13 @@ class FlexKVConnector:
         ):
             return
         kvcache.register_layer_transfer_counter(self.layer_done_counter)
+        if self._draft_pools:
+            from flexkv.integration.sglang.draft_cache import DraftLayerCounter
+
+            counter = DraftLayerCounter(self.layer_done_counter)
+            for pool in self._draft_pools:
+                if hasattr(pool, "register_layer_transfer_counter"):
+                    pool.register_layer_transfer_counter(counter)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -2418,6 +2438,67 @@ class FlexKVConnector:
             layer_indices=tuple(active_layer_indices),
             logical_layer_count=len(buffers),
         )
+
+    def _resolve_draft_registration(self, pool, drafts, args, configured_groups, key_format="token"):
+        from flexkv.integration.sglang.draft_cache import build_draft_registration
+
+        model = self.model_config
+        group = self._sync_ctx.attn_tp_cpu_group
+        try:
+            if model.cp_size > 1 or getattr(pool, "layer_shard_enabled", False):
+                raise ValueError("Speculative KV with CP layer split requires the cache layer split integration")
+            if (self._is_dsv4 or self._swa_kv_pool is not None or self._kvcache is not pool
+                    or GLOBAL_CONFIG_FROM_ENV.cpu_layout_type != KVCacheLayoutType.BLOCKFIRST
+                    or GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode == "all_write"
+                    or self.cache_config.enable_gds or os.getenv("FLEXKV_ENABLE_NVCOMP") == "1"
+                    or not GLOBAL_CONFIG_FROM_ENV.region_batch):
+                raise ValueError("Speculative KV requires a full-attention pool and BLOCKFIRST host transfers")
+            if model.effective_tp_size > 1 and (group is None or group.size() != model.effective_tp_size
+                                                or not self._sync_ctx.needs_sync):
+                raise ValueError("Speculative KV requires one synchronized attention TP group")
+            pools = drafts if isinstance(drafts, (tuple, list)) else (() if drafts is None else (drafts,))
+            regions = build_draft_registration(pool, pools, model, self.page_size)
+            specs = [r.spec for r in regions]
+            if configured_groups is not None and configured_groups != specs:
+                raise ValueError("Configured cache groups differ from target and draft storage")
+            identity = [getattr(args, name, None) for name in (
+                "model_path", "revision", "speculative_algorithm", "speculative_draft_model_path",
+                "speculative_draft_model_revision", "speculative_num_steps", "speculative_eagle_topk",
+                "speculative_draft_window_size", "speculative_draft_sink_size", "tp_size",
+                "kv_cache_dtype", "quantization", "speculative_draft_model_quantization")]
+            schema = [(r.name, r.spec.layer_indices, r.spec.num_kv_heads, r.spec.head_size,
+                       str(r.spec.dtype), r.spec.compress_ratio, None) for r in regions]
+            pool_formats = [(type(p).__qualname__, str(getattr(p, "dtype", None)),
+                             str(getattr(p, "store_dtype", None)),
+                             getattr(p, "storage_format_tag", None)) for p in (pool, *pools)]
+            identity += [pool_formats, key_format, self.page_size, model.tp_size, model.cp_size, getattr(model, "h2d_layer_holders", None), schema]
+            if model.nnodes > 1:
+                identity.append(model.nnodes)
+            key = hashlib.sha256(json.dumps(identity, default=str).encode()).hexdigest()
+            signature = (key, regions[0].layout.num_block)
+            error = None
+        except Exception as exc:
+            signature, error = None, str(exc)
+        peers = [(error, signature)]
+        if group is not None and group.size() > 1:
+            peers = [None] * group.size()
+            torch.distributed.all_gather_object(peers, (error, signature), group=group)
+        for rank, (err, _) in enumerate(peers):
+            if err is not None:
+                raise ValueError(f"Speculative KV registration failed on rank {rank}: {err}")
+        if any(peer != signature for _, peer in peers):
+            raise ValueError("Speculative KV identity or layout differs across ranks")
+
+        first = regions[0]
+        model = replace(model, kv_dim=1, num_kv_heads=first.layout.num_kv_heads,
+                        head_size=first.spec.head_size, dtype=first.spec.dtype, layer_groups=specs)
+        model.freeze()
+        self.model_config = self.flexkv_config.model_config = model
+        self.rank_info = replace(self.rank_info, model_config=model)
+        self._draft_pools = tuple(pools)
+        self._draft_regions = regions
+        self._cache_layout_key = f"flexkv.speculative.v1.{key}"
+        return first.buffers, None
 
     def _validate_kv_pool_support(
         self, kvcache: Any, pool: Any, server_args: Any
@@ -3003,7 +3084,15 @@ class FlexKVConnector:
         indexer_group: Optional[_IndexerBufferGroup] = None,
     ) -> None:
         assert len(kv_caches) > 0
-        if self._is_dsv4:
+        if self._draft_regions:
+            regions = self._draft_regions
+            self.tp_client.register_to_server(
+                kv_caches=regions[0].buffers,
+                kv_layout=regions[0].layout,
+                layer_groups=[r.spec for r in regions], gpu_layouts=[r.layout for r in regions],
+                handles_per_group=[r.buffers for r in regions],
+            )
+        elif self._is_dsv4:
             self._register_dsv4_to_server(kv_caches)
         else:
             self._register_standard_to_server(kv_caches, indexer_group)
