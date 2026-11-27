@@ -26,6 +26,7 @@ Modes:
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import math
@@ -81,6 +82,12 @@ _INFO_STATUSES = {"hit", "miss", "skipped", "success"}
 _WARNING_STATUSES = {"cancelled", "failed", "missing", "not_found", "timeout"}
 # Minimum gap between idle engine nudges in non-chunked mode (seconds).
 _IDLE_DRIVE_INTERVAL_S = 0.1
+
+
+class StoreSubmissionUncertainError(RuntimeError):
+    """A writeback may already be reading the caller's source slots."""
+
+    store_submission_uncertain = True
 
 
 @dataclass
@@ -221,6 +228,16 @@ class FlexKVConnector:
     """
 
     _chunked_namespace_supported = True
+    _cache_layout_key = None
+
+    def _cache_namespace(self, namespace):
+        if self._cache_layout_key is None:
+            return namespace
+        return [self._cache_layout_key, json.dumps(namespace or [], separators=(",", ":"))]
+
+    @property
+    def _coordinated_restore(self) -> bool:
+        return False
 
     @property
     def supports_cache_namespace(self) -> bool:
@@ -348,7 +365,56 @@ class FlexKVConnector:
                 self._label,
             )
 
+        pool = getattr(kvcache, "full_kv_pool", kvcache)
+        self._validate_kv_pool_support(kvcache, pool, server_args)
         kv_caches, indexer_group = self._resolve_kv_buffers(kvcache)
+        if (
+            not self._is_dsv4
+            and kv_caches
+            and kv_caches[0].ndim == 3
+            and self.model_config.kv_dim == 1
+            and self.model_config.num_kv_heads == 1
+        ):
+            sample_kv = kv_caches[0]
+            if (
+                sample_kv.dtype != self.model_config.dtype
+                or sample_kv.shape[2] != self.model_config.head_size
+            ):
+                model_config = replace(
+                    self.model_config,
+                    dtype=sample_kv.dtype,
+                    head_size=sample_kv.shape[2],
+                )
+                model_config.freeze()
+                self.model_config = self.flexkv_config.model_config = model_config
+                self.rank_info = replace(self.rank_info, model_config=model_config)
+            storage_format_tag = getattr(pool, "storage_format_tag", None)
+            if storage_format_tag is not None and self._cache_layout_key is None:
+                indexer_desc = (
+                    (
+                        indexer_group.layer_indices,
+                        str(indexer_group.buffers[0].dtype),
+                        indexer_group.buffers[0].shape[1],
+                    )
+                    if indexer_group is not None
+                    else None
+                )
+                format_layout = (
+                    self.model_config.num_layers,
+                    self.page_size,
+                    str(sample_kv.dtype),
+                    sample_kv.shape[2],
+                    storage_format_tag,
+                    indexer_desc,
+                    (
+                        getattr(server_args, "model_path", None),
+                        getattr(server_args, "revision", None),
+                    ),
+                )
+                digest = hashlib.sha256(
+                    json.dumps(format_layout, default=str).encode()
+                ).hexdigest()
+                self._cache_layout_key = f"flexkv.format.v1.{digest}"
         if self._swa_kv_pool is not None and self.cache_config.swa is not None:
             buffers = self._swa_kv_pool.kv_buffer
             snapshot_bytes = sum(
@@ -680,7 +746,7 @@ class FlexKVConnector:
                     token_mask=mask_np,
                     cpu_only=getattr(self, "_chunked_prefetch", False),
                     swa_aware=self._swa_kv_pool is not None,
-                    namespace=namespace,
+                    namespace=self._cache_namespace(namespace),
                 )
             except Exception as exc:  # noqa: BLE001
                 lookup_error = exc
@@ -819,6 +885,39 @@ class FlexKVConnector:
         responsible for having allocated ``slot_mapping`` of length
         equal to ``hit_length`` from a prior ``lookup_kv``.
         """
+        if not self._coordinated_restore:
+            return self._retrieve_whole_kv(rid, slot_mapping)
+
+        if self.enable_layerwise:
+            # A caller can request synchronous reads while the engine has only a
+            # PER_LAYER worker. Submit through that worker and consume its fds.
+            idle = not getattr(self, "_prepared_layerwise_loads", None) and self.layer_done_counter.consumer_index < 0
+            if not self._sync_ctx.all_reduce_min(int(idle)):
+                raise RuntimeError("A synchronous restore cannot consume an active layerwise batch")
+            loaded, _ = self.start_load_kv_layerwise(rid, slot_mapping, defer_launch=True)
+            if loaded:
+                self.flush_layerwise_loads([rid])
+                try:
+                    for layer in range(self.model_config.num_layers):
+                        self.layer_done_counter.wait_until(layer)
+                except Exception:
+                    self._sync_ctx.all_reduce_min(-1)
+                    raise
+                if self._sync_ctx.all_reduce_min(loaded) < 0:
+                    raise RuntimeError("Layerwise wait failed on a peer")
+            return loaded
+
+        try:
+            loaded = self._retrieve_whole_kv(rid, slot_mapping)
+        except Exception:
+            self._sync_ctx.all_reduce_min(-1)
+            raise
+        loaded = self._sync_ctx.all_reduce_min(loaded)
+        if loaded < 0:
+            raise RuntimeError("KV restore failed on a peer")
+        return loaded
+
+    def _retrieve_whole_kv(self, rid: str, slot_mapping: torch.Tensor) -> int:
         fkv_task_id = self._pending_lookups.pop(rid, -1)
         if fkv_task_id < 0:
             return 0
@@ -839,12 +938,16 @@ class FlexKVConnector:
 
         n = slot_mapping_cpu.numel()
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            if self._coordinated_restore:
+                # Single-task launch preserves the lookup ID, including when
+                # transport fails after submission. Reset can drain that ID.
+                self._launched_load_tids.append(fkv_task_id)
             try:
                 self.kv_manager.launch(
                     task_ids=[fkv_task_id],
                     slot_mappings=[slot_mapping_cpu],
                     swa_slot_mappings=[swa_slot_mapping],
-                    as_batch=True,
+                    as_batch=not self._coordinated_restore,
                     layerwise_transfer=False,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -869,7 +972,9 @@ class FlexKVConnector:
                 swa_slots=swa_slots,
             )
             try:
-                resp = self.kv_manager.wait([fkv_task_id], timeout=30.0) or {}
+                resp = self.kv_manager.wait(
+                    [fkv_task_id], timeout=30.0, completely=self._coordinated_restore
+                ) or {}
             except Exception as exc:  # noqa: BLE001
                 self._log_cache_op(
                     context,
@@ -893,9 +998,13 @@ class FlexKVConnector:
                 slots=n,
                 swa_slots=swa_slots,
             )
+            if self._coordinated_restore:
+                if not _is_terminal_status(status):
+                    raise RuntimeError(f"KV restore {fkv_task_id} has uncertain completion: {status}")
+                self._launched_load_tids.remove(fkv_task_id)
             if not success:
                 n = 0
-        if self._sync_ctx.needs_sync:
+        if self._sync_ctx.needs_sync and not self._coordinated_restore:
             self._sync_ctx.barrier()
         return n
 
@@ -1128,6 +1237,9 @@ class FlexKVConnector:
             )
             return n, producer_id
 
+        coordinated = self._coordinated_restore
+        if coordinated:
+            self._layerwise_batch_launch_error = "Layerwise launch is unresolved"
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 launched_task_ids = self.kv_manager.launch(
@@ -1137,6 +1249,29 @@ class FlexKVConnector:
                     as_batch=True,
                     layerwise_transfer=True,
                     counter_id=producer_id,
+                )
+                if coordinated and len(launched_task_ids) != 1:
+                    raise RuntimeError("Expected one layerwise batch task")
+                # A layerwise launch is always merged into a batch task. Track the
+                # IDs returned by launch(), not the lookup task ID that the merge
+                # removes from FlexKV's task table.
+                self._launched_load_tids.extend(launched_task_ids)
+                for launched_task_id in launched_task_ids:
+                    self._launched_load_contexts[launched_task_id] = replace(
+                        context,
+                        task_id=launched_task_id,
+                        start_ns=load_start_ns,
+                    )
+                self._log_cache_op(
+                    context,
+                    "launch",
+                    "running",
+                    direction="H2D",
+                    flexkv_batch_task_ids=launched_task_ids,
+                    transfer_mode="layerwise",
+                    slots=n,
+                    swa_slots=swa_slots,
+                    producer_id=producer_id,
                 )
             except Exception as exc:  # noqa: BLE001
                 self._log_cache_op(
@@ -1149,29 +1284,14 @@ class FlexKVConnector:
                     stage="launch",
                     error=str(exc),
                 )
+                if coordinated:
+                    self._sync_ctx.all_reduce_min(0)
                 raise
-            # A layerwise launch is always merged into a batch task. Track the
-            # IDs returned by launch(), not the lookup task ID that the merge
-            # removes from FlexKV's task table.
-            self._launched_load_tids.extend(launched_task_ids)
-            for launched_task_id in launched_task_ids:
-                self._launched_load_contexts[launched_task_id] = replace(
-                    context,
-                    task_id=launched_task_id,
-                    start_ns=load_start_ns,
-                )
-            self._log_cache_op(
-                context,
-                "launch",
-                "running",
-                direction="H2D",
-                flexkv_batch_task_ids=launched_task_ids,
-                transfer_mode="layerwise",
-                slots=n,
-                swa_slots=swa_slots,
-                producer_id=producer_id,
-            )
 
+        if coordinated:
+            if not self._sync_ctx.all_reduce_min(1):
+                raise RuntimeError("Layerwise launch failed on a peer")
+            self._layerwise_batch_launch_error = None
         return n, producer_id
 
     def flush_layerwise_loads(self, request_ids: List[str]) -> None:
@@ -1376,7 +1496,8 @@ class FlexKVConnector:
         stage leader also forwards its local slot mapping.
 
         Returns the FlexKV task id of the in-flight store, or -1 if
-        nothing needed to be written.
+        nothing needed to be written. On StoreSubmissionUncertainError,
+        keep the source slots pinned until completion or reset.
         """
         context = self._new_op_context("store", rid, sglang_req_id)
         with self._store_profile_scope("flexkv.connector.store.tokens_to_numpy"):
@@ -1421,7 +1542,7 @@ class FlexKVConnector:
             try:
                 with self._store_profile_scope("flexkv.connector.store.put_match"):
                     res = self.kv_manager.put_match(
-                        token_ids=token_ids_np, token_mask=None, namespace=namespace
+                        token_ids=token_ids_np, token_mask=None, namespace=self._cache_namespace(namespace)
                     )
             except Exception as exc:  # noqa: BLE001
                 match_error = exc
@@ -1476,6 +1597,11 @@ class FlexKVConnector:
                         if swa_slot_mapping is None
                         else int(swa_slot_mapping.numel())
                     )
+                    if self._coordinated_restore:
+                        # Keep the lookup ID even if launch or its acknowledgement
+                        # fails. Reset must drain the reader before releasing slots.
+                        self._inflight_stores[rid] = fkv_task_id
+                        self._inflight_store_contexts[rid] = context
                     try:
                         with self._store_profile_scope(
                             "flexkv.connector.store.kvmanager_launch"
@@ -1488,7 +1614,7 @@ class FlexKVConnector:
                                 layerwise_transfer=False,
                             )
                     except Exception as exc:  # noqa: BLE001
-                        store_start["error"] = str(exc)
+                        store_start["error"] = str(exc) or type(exc).__name__
                         self._log_cache_op(
                             context,
                             "complete",
@@ -1520,33 +1646,42 @@ class FlexKVConnector:
                         tokens=0,
                     )
 
-        if self._sync_ctx.needs_sync:
-            with self._store_profile_scope("flexkv.connector.store.scatter_start"):
-                store_start = self._sync_ctx.scatter(
-                    store_start,
-                    channel=FlexKVScatterChannel.STORE_START,
+        try:
+            if self._sync_ctx.needs_sync:
+                with self._store_profile_scope("flexkv.connector.store.scatter_start"):
+                    store_start = self._sync_ctx.scatter(
+                        store_start,
+                        channel=FlexKVScatterChannel.STORE_START,
+                    )
+            if store_start.get("rid") != rid:
+                raise RuntimeError(
+                    "[FlexKV] store-start rid mismatch: "
+                    f"local={rid!r}, leader={store_start.get('rid')!r}"
                 )
-        if store_start.get("rid") != rid:
-            raise RuntimeError(
-                "[FlexKV] store-start rid mismatch: "
-                f"local={rid!r}, leader={store_start.get('rid')!r}"
-            )
-        if store_start.get("error"):
-            raise RuntimeError(
-                f"[FlexKV] store launch failed: {store_start['error']}"
-            )
-        if not store_start.get("active"):
-            return -1
+            if store_start.get("error"):
+                raise RuntimeError(
+                    f"[FlexKV] store launch failed: {store_start['error']}"
+                )
+            if not store_start.get("active"):
+                return -1
 
-        fkv_task_id = int(store_start["task_id"])
-        slot_count = int(store_start.get("slot_count", -1))
-        mask_list = store_start.get("unmatched_mask", [])
-        if fkv_task_id < 0 or slot_count != len(kv_indices):
-            raise RuntimeError(
-                "[FlexKV] invalid store-start payload: "
-                f"task_id={fkv_task_id}, slot_count={slot_count}, "
-                f"slot_len={len(kv_indices)}"
-            )
+            fkv_task_id = int(store_start["task_id"])
+            slot_count = int(store_start.get("slot_count", -1))
+            mask_list = store_start.get("unmatched_mask", [])
+            if fkv_task_id < 0 or slot_count != len(kv_indices):
+                raise RuntimeError(
+                    "[FlexKV] invalid store-start payload: "
+                    f"task_id={fkv_task_id}, slot_count={slot_count}, "
+                    f"slot_len={len(kv_indices)}"
+                )
+        except Exception as exc:
+            # At this point the leader may have launched D2H. Only the leader
+            # can rule that out when the start notification is unavailable.
+            if self._coordinated_restore and (
+                not self._sync_ctx.is_sync_leader or rid in self._inflight_stores
+            ):
+                raise StoreSubmissionUncertainError(str(exc)) from exc
+            raise
 
         # Cross-node PP needs the local PP stage's physical slot mapping.
         if self._sync_ctx.should_send_slot_mapping_to_remote:
@@ -1698,6 +1833,7 @@ class FlexKVConnector:
     ) -> int:
         if not self._prefetch_enabled or not rid:
             return -1
+        namespace = self._cache_namespace(namespace)
         if getattr(self, "_chunked_prefetch", False):
             return self._start_chunked_prefetch(rid, token_ids, candidate_start_token, namespace)
         context = self._new_op_context("prefetch", rid, sglang_req_id)
@@ -2283,6 +2419,89 @@ class FlexKVConnector:
             logical_layer_count=len(buffers),
         )
 
+    def _validate_kv_pool_support(
+        self, kvcache: Any, pool: Any, server_args: Any
+    ) -> None:
+        """Fail loudly at startup on sharding/quantization/hybrid layouts FlexKV does not support."""
+        if (
+            getattr(server_args, "enable_kv_cache_sharding", False)
+            or getattr(kvcache, "placement", None) is not None
+            or getattr(pool, "placement", None) is not None
+        ):
+            raise ValueError(
+                "FlexKV does not support page-interleaved KV cache sharding "
+                "(--enable-kv-cache-sharding / PageInterleaveKVPool); "
+                "disable KV cache sharding or use CP layer split instead"
+            )
+        if (
+            getattr(server_args, "enable_hisparse", False)
+            or getattr(kvcache, "full_to_hisparse_device_index_mapping", None) is not None
+            or getattr(pool, "full_to_hisparse_device_index_mapping", None) is not None
+        ):
+            raise ValueError(
+                "FlexKV does not support HiSparse KV pools (--enable-hisparse); "
+                "disable HiSparse when enabling FlexKV"
+            )
+        if (
+            int(getattr(server_args, "dcp_size", 1) or 1) > 1
+            or int(getattr(server_args, "attn_dcp_size", 1) or 1) > 1
+        ):
+            raise ValueError(
+                "FlexKV does not support Decode Context Parallel (--dcp-size > 1) yet; "
+                "disable DCP when enabling FlexKV"
+            )
+        if (
+            getattr(server_args, "enable_unified_memory", False)
+            or getattr(kvcache, "_arena", None) is not None
+            or getattr(pool, "_arena", None) is not None
+            or getattr(kvcache, "requires_physical_write_loc", False)
+            or getattr(pool, "requires_physical_write_loc", False)
+        ):
+            raise ValueError(
+                "FlexKV does not support unified-memory / RoutedKVCache pools "
+                "(--enable-unified-memory); disable unified memory when enabling FlexKV"
+            )
+        dynamic_int8 = (
+            (
+                getattr(kvcache, "enable_int8_kv_cache", False)
+                or getattr(pool, "enable_int8_kv_cache", False)
+            )
+            and not (
+                getattr(kvcache, "int8_kv_cache_offline_load", False)
+                or getattr(pool, "int8_kv_cache_offline_load", False)
+            )
+        )
+        has_external_scales = any(
+            getattr(target_pool, attr, None) is not None
+            for target_pool in (kvcache, pool)
+            for attr in ("kv_scale_buffer", "k_scale_buffer", "v_scale_buffer")
+        )
+        if has_external_scales or dynamic_int8:
+            raise ValueError(
+                "FlexKV does not support KV pools with external quantization scale buffers "
+                "(FP4 / MXFP8 / dynamic INT8 KV); use BF16/FP16/FP8, offline INT8, or TurboQuant KV"
+            )
+        if (
+            getattr(kvcache, "mamba_pool", None) is not None
+            or getattr(pool, "mamba_pool", None) is not None
+        ):
+            raise ValueError(
+                "FlexKV does not support Hybrid Mamba/Linear-Attention KV pools "
+                "(HybridLinearKVPool / mamba_pool) yet"
+            )
+        if (
+            getattr(kvcache, "sparse_layer_id_mapping", None) is not None
+            or getattr(pool, "sparse_layer_id_mapping", None) is not None
+        ):
+            raise ValueError(
+                "FlexKV does not support MiniMaxSparseKVPool / UnlimitedOCRV2KVPool yet"
+            )
+        if not self._is_dsv4 and self._swa_kv_pool is not None:
+            raise ValueError(
+                "FlexKV currently supports hybrid SWA KV pools only for DeepSeek V4; "
+                f"got unsupported SWA pool {type(kvcache).__name__}"
+            )
+
     def _resolve_kv_buffers(
         self, kvcache: Any
     ) -> Tuple[List[torch.Tensor], Optional[_IndexerBufferGroup]]:
@@ -2319,6 +2538,10 @@ class FlexKVConnector:
             if hasattr(kvcache, "kv_buffer"):
                 return list(kvcache.kv_buffer), indexer_group
             if hasattr(kvcache, "k_buffer"):
+                if getattr(kvcache, "v_buffer", None) is None:
+                    raise ValueError(
+                        "FlexKV does not support K-only KV pools without v_buffer"
+                    )
                 return (
                     list(kvcache.k_buffer) + list(kvcache.v_buffer),
                     indexer_group,

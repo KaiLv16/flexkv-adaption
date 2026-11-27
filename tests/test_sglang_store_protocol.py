@@ -3,11 +3,20 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 
 from flexkv.common.request import KVResponse, KVResponseStatus
 from flexkv.integration.sglang.comm import FlexKVScatterChannel
-from flexkv.integration.sglang.connector import FlexKVConnector
+from flexkv.integration.sglang.connector import FlexKVConnector, StoreSubmissionUncertainError
+
+
+class _CoordinatedConnector(FlexKVConnector):
+    _force_coordinated: bool = False
+
+    @property
+    def _coordinated_restore(self) -> bool:
+        return self._force_coordinated
 
 
 def _follower_connector(payload):
@@ -353,6 +362,133 @@ def test_namespace_capability_is_explicit_for_all_active_paths():
     assert connector.supports_cache_namespace is False
     connector._chunked_namespace_supported = True
     assert connector.supports_cache_namespace is True
+
+
+def test_namespace_is_forwarded_to_lookup_store_and_prefetch():
+    connector = _follower_connector(None)
+    connector._sync_ctx.is_sync_leader = True
+    connector._sync_ctx.needs_sync = False
+    connector._sync_ctx.is_pp_active = False
+    connector._swa_kv_pool = None
+    connector._pending_lookups = {}
+    connector._pending_lookup_contexts = {}
+    connector._prefetch_enabled = True
+    connector._ongoing_prefetches = {}
+    connector._prefetch_contexts = {}
+    connector._prefetch_planned_tokens = {}
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.get_match.return_value = (-1, np.zeros(4, dtype=bool))
+    connector.kv_manager.put_match.return_value = (-1, np.zeros(4, dtype=bool))
+    connector.kv_manager.prefetch_async.return_value = (23, 4)
+    namespace = ['["sglang-cache-v1","adapter","salt"]']
+    connector.lookup_kv([1, 2, 3, 4], torch.ones(4, dtype=torch.bool), rid="r", namespace=namespace)
+    connector.store_kv("r", [1, 2, 3, 4], torch.arange(4), namespace=namespace)
+    assert connector.prefetch_async("r", [1, 2, 3, 4], namespace=namespace) == 23
+    for method in (connector.kv_manager.get_match, connector.kv_manager.put_match, connector.kv_manager.prefetch_async):
+        assert method.call_args.kwargs["namespace"] == namespace
+        assert method.call_args.kwargs["token_ids"].tolist() == [1, 2, 3, 4]
+
+
+def test_coordinated_store_marks_uncertainty_after_launch_attempt():
+    connector = FlexKVConnector.__new__(_CoordinatedConnector)
+    connector._force_coordinated = True
+    connector.page_size = 1
+    connector._swa_kv_pool = None
+    connector._sync_ctx = SimpleNamespace(
+        is_sync_leader=True,
+        needs_sync=True,
+        should_send_slot_mapping_to_remote=False,
+        is_cross_node_pp=False,
+        scatter=MagicMock(side_effect=lambda value, **_: value),
+    )
+    connector._inflight_stores = {}
+    connector._inflight_store_contexts = {}
+    connector._new_op_context = MagicMock(return_value=SimpleNamespace(task_id=-1))
+    connector._log_cache_op = MagicMock()
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.put_match.return_value = (17, np.ones(4, dtype=np.bool_))
+    connector.kv_manager.launch.side_effect = OSError()
+
+    with pytest.raises(StoreSubmissionUncertainError, match="OSError"):
+        connector.store_kv("request", range(4), torch.arange(4))
+    assert connector._inflight_stores == {"request": 17}
+
+
+def test_coordinated_store_notification_failure_without_launch_has_no_task():
+    connector = FlexKVConnector.__new__(_CoordinatedConnector)
+    connector._force_coordinated = True
+    connector.page_size = 1
+    connector._sync_ctx = SimpleNamespace(
+        is_sync_leader=True,
+        needs_sync=True,
+        should_send_slot_mapping_to_remote=False,
+        scatter=MagicMock(side_effect=OSError("start notification failed")),
+    )
+    connector._inflight_stores = {}
+    connector._inflight_store_contexts = {}
+    connector._new_op_context = MagicMock(return_value=SimpleNamespace(task_id=-1))
+    connector._log_cache_op = MagicMock()
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.put_match.return_value = None
+
+    with pytest.raises(OSError, match="start notification failed"):
+        connector.store_kv("request", range(4), torch.arange(4))
+    assert not connector._inflight_stores
+    connector.kv_manager.launch.assert_not_called()
+
+
+def test_coordinated_retrieve_propagates_peer_failure():
+    connector = FlexKVConnector.__new__(_CoordinatedConnector)
+    connector._force_coordinated = True
+    connector.enable_layerwise = False
+    connector._pending_lookups = {}
+    connector._pending_lookup_contexts = {}
+    connector._sync_ctx = SimpleNamespace(
+        is_sync_leader=False,
+        needs_sync=True,
+        should_send_slot_mapping_to_remote=False,
+        all_reduce_min=MagicMock(return_value=-1),
+    )
+    connector._pop_context = MagicMock(return_value=SimpleNamespace(task_id=-1))
+
+    with pytest.raises(RuntimeError, match="KV restore failed on a peer"):
+        connector.retrieve_kv("r", torch.arange(4))
+
+
+def test_validate_kv_pool_support_rejects_unsupported_layouts_and_k_only():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._is_dsv4 = False
+    connector._swa_kv_pool = None
+    connector._deduplicate_indexer_group = False
+
+    base_args = lambda **kw: SimpleNamespace(**kw)
+    ok_pool = SimpleNamespace(kv_buffer=[torch.zeros((4, 1, 8))])
+    connector._validate_kv_pool_support(ok_pool, ok_pool, base_args())
+
+    cases = [
+        (ok_pool, base_args(enable_kv_cache_sharding=True), "page-interleaved"),
+        (ok_pool, base_args(enable_hisparse=True), "HiSparse"),
+        (ok_pool, base_args(dcp_size=2), "Decode Context Parallel"),
+        (ok_pool, base_args(enable_unified_memory=True), "unified-memory"),
+        (SimpleNamespace(k_scale_buffer=[torch.ones(1)]), base_args(), "external quantization scale"),
+        (SimpleNamespace(enable_int8_kv_cache=True, int8_kv_cache_offline_load=False), base_args(), "external quantization scale"),
+        (SimpleNamespace(mamba_pool=object()), base_args(), "Mamba"),
+        (SimpleNamespace(sparse_layer_id_mapping={0: 0}), base_args(), "MiniMaxSparseKVPool"),
+    ]
+    for pool, args, msg in cases:
+        with pytest.raises(ValueError, match=msg):
+            connector._validate_kv_pool_support(pool, pool, args)
+
+    # Offline INT8 is permitted
+    connector._validate_kv_pool_support(
+        SimpleNamespace(enable_int8_kv_cache=True, int8_kv_cache_offline_load=True),
+        SimpleNamespace(enable_int8_kv_cache=True, int8_kv_cache_offline_load=True),
+        base_args(),
+    )
+
+    # K-only without v_buffer is rejected explicitly
+    with pytest.raises(ValueError, match="K-only"):
+        connector._resolve_kv_buffers(SimpleNamespace(k_buffer=[torch.zeros(4)], v_buffer=None))
 
 
 def test_namespace_is_forwarded_to_lookup_store_and_prefetch():

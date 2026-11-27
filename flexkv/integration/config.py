@@ -257,6 +257,8 @@ class FlexKVConfig:
             "fp4": torch.uint8,
             "e2m1": torch.uint8,
             "fp4_e2m1": torch.uint8,
+            # TurboQuant packs 4-bit KV payload + BF16/scale bytes into uint8.
+            "turboquant_4bit_nc": torch.uint8,
         }
 
         def _parse(s: str) -> torch.dtype:
