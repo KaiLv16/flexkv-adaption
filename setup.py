@@ -400,6 +400,8 @@ if enable_gdr:
     extra_compile_args.append("-DFLEXKV_ENABLE_GDR")
     if gdr_backend == "mapped":
         extra_compile_args.append("-DFLEXKV_GDR_MAPPED")
+    if os.environ.get("FLEXKV_GDR_WR_API", "1") == "1":
+        extra_compile_args.append("-DFLEXKV_GDR_WR_API")
     extra_link_args.append("-libverbs")
 include_dirs = [
     os.path.abspath(os.path.join(build_dir, "include")),

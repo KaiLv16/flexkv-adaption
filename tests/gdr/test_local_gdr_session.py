@@ -165,6 +165,49 @@ class LocalGdrLeaseTest(unittest.TestCase):
         local_gdr.close_routes(group, [Lease()])
         self.assertEqual(order, ["QP closed", b"D", "fd closed"])
 
+    def test_dir_qp_count_and_max_sge_validation(self):
+        with patch.dict(os.environ, {"FLEXKV_GDR_H2D_QP_COUNT": "2", "FLEXKV_GDR_D2H_QP_COUNT": "4",
+                                     "FLEXKV_GDR_MAX_SGE": "8"}):
+            self.assertEqual(local_gdr._dir_qp_count("FLEXKV_GDR_H2D_QP_COUNT", 4), 2)
+            self.assertEqual(local_gdr._dir_qp_count("FLEXKV_GDR_D2H_QP_COUNT", 4), 4)
+            self.assertEqual(local_gdr._max_sge(), 8)
+        with patch.dict(os.environ, {"FLEXKV_GDR_H2D_QP_COUNT": "5"}):
+            with self.assertRaises(ValueError):
+                local_gdr._dir_qp_count("FLEXKV_GDR_H2D_QP_COUNT", 4)
+        with patch.dict(os.environ, {"FLEXKV_GDR_MAX_SGE": "17"}):
+            with self.assertRaises(ValueError):
+                local_gdr._max_sge()
+
+    def test_emit_diag_respects_logger_level(self):
+        enabled_log = types.SimpleNamespace(isEnabledFor=lambda lvl: lvl >= 20, info=Mock(), warning=Mock())
+        local_gdr._emit_diag(enabled_log, "profile %s", 1)
+        enabled_log.info.assert_called_once_with("profile %s", 1)
+        enabled_log.warning.assert_not_called()
+
+        quiet_log = types.SimpleNamespace(isEnabledFor=lambda _lvl: False, info=Mock(), warning=Mock())
+        local_gdr._emit_diag(quiet_log, "profile %s", 2)
+        quiet_log.warning.assert_called_once_with("profile %s", 2)
+
+    def test_worker_d2h_batch_hooks_call_region_batch(self):
+        from flexkv.common.transfer import TransferType
+        from flexkv.transfer.worker_op import WorkerTransferOp
+        from flexkv.transfer.workers.gpu_cpu import GPUCPUTransferWorker
+
+        w = object.__new__(GPUCPUTransferWorker)
+        w.region_batch = types.SimpleNamespace(begin_d2h_batch=Mock(), end_d2h_batch=Mock())
+
+        h2d_op = object.__new__(WorkerTransferOp)
+        h2d_op.transfer_type = TransferType.H2D
+        w._begin_transfer_batch([h2d_op])
+        w.region_batch.begin_d2h_batch.assert_not_called()
+
+        d2h_op = object.__new__(WorkerTransferOp)
+        d2h_op.transfer_type = TransferType.D2H
+        w._begin_transfer_batch([h2d_op, d2h_op])
+        w.region_batch.begin_d2h_batch.assert_called_once()
+        w._end_transfer_batch()
+        w.region_batch.end_d2h_batch.assert_called_once()
+
 
 @unittest.skipUnless(sys.platform == "linux" and importlib.util.find_spec("torch"),
                      "requires a FlexKV runtime on Linux")

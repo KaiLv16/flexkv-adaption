@@ -31,6 +31,20 @@ def _qp_count():
     return count
 
 
+def _dir_qp_count(var_name, qp_count):
+    value = int(os.environ.get(var_name, "0"))
+    if not 0 <= value <= qp_count:
+        raise ValueError(f"{var_name} must be 0 (auto) or 1..{qp_count}")
+    return value
+
+
+def _max_sge():
+    value = int(os.environ.get("FLEXKV_GDR_MAX_SGE", "0"))
+    if not 0 <= value <= 16:
+        raise ValueError("FLEXKV_GDR_MAX_SGE must be 0 (auto) or 1..16")
+    return value
+
+
 def _valid_qpns(values, count):
     return (isinstance(values, list) and len(values) == count
             and all(type(qpn) is int and 0 < qpn <= 0xFFFFFF for qpn in values)
@@ -47,6 +61,14 @@ def _read(stream):
 def _write(stream, message):
     stream.write(json.dumps(message).encode() + b"\n")
     stream.flush()
+
+
+def _emit_diag(log, msg, *args):
+    is_enabled = getattr(log, "is_enabled_for", None) or getattr(log, "isEnabledFor", None)
+    if is_enabled is not None and is_enabled(20):
+        log.info(msg, *args)
+    else:
+        log.warning(msg, *args)
 
 
 class Owner:
@@ -89,6 +111,7 @@ class Owner:
         self.confirmed_sockets = set()
         self.retiring = False
         self.uncertain = False
+        self._profile = os.environ.get("FLEXKV_GDR_PROFILE") == "1"
         try:
             self.listener.bind(self.path)
             self.listener.listen()
@@ -138,7 +161,7 @@ class Owner:
         targets = []
         posted_possible = False
         try:
-            with conn, conn.makefile("rwb") as stream:
+            with conn, conn.makefile("rwb", buffering=0) as stream:
                 conn.settimeout(_TIMEOUT)
                 request = _read(stream)
                 senders = request.get("qpns")
@@ -163,13 +186,57 @@ class Owner:
                 stream.write(b"A")
                 stream.flush()
                 conn.settimeout(None)
+                profile_on = getattr(self, "_profile", False)
+                if hasattr(c_ext, "gdr_serve_owner_commands"):
+                    drained, r_calls, r_sync_ns, r_total_ns, v_calls, v_sync_ns, v_total_ns = (
+                        c_ext.gdr_serve_owner_commands(conn.fileno(), self.device, profile_on)
+                    )
+                    if not drained:
+                        return
+                    if profile_on:
+                        _emit_diag(
+                            self._log,
+                            "Local GDR owner profile (device=%s, R_calls=%d, R_sync_ms=%.3f, "
+                            "R_total_ms=%.3f, V_calls=%d, V_sync_ms=%.3f, V_total_ms=%.3f)",
+                            self.device, r_calls, r_sync_ns / 1e6, r_total_ns / 1e6,
+                            v_calls, v_sync_ns / 1e6, v_total_ns / 1e6,
+                        )
+                    with self.lock:
+                        while targets:
+                            self.endpoint.release(targets[len(targets) - 1])
+                            targets.pop()
+                        self.confirmed_sockets.discard(conn)
+                    stream.write(b"A")
+                    stream.flush()
+                    return
+                prof = [0, 0, 0, 0, 0, 0]  # r_calls, r_sync_ns, r_total_ns, v_calls, v_sync_ns, v_total_ns
                 while True:
                     command = stream.read(1)
                     if command == b"R":
-                        c_ext.gdr_producer_ready(self.device)
+                        if profile_on:
+                            import time
+                            t0 = time.perf_counter_ns()
+                            c_ext.gdr_producer_ready(self.device)
+                            t1 = time.perf_counter_ns()
+                        else:
+                            c_ext.gdr_producer_ready(self.device)
                     elif command == b"V":
-                        c_ext.gdr_device_visible(self.device)
+                        if profile_on:
+                            import time
+                            t0 = time.perf_counter_ns()
+                            c_ext.gdr_device_visible(self.device)
+                            t1 = time.perf_counter_ns()
+                        else:
+                            c_ext.gdr_device_visible(self.device)
                     elif command == b"D":
+                        if profile_on:
+                            _emit_diag(
+                                self._log,
+                                "Local GDR owner profile (device=%s, R_calls=%d, R_sync_ms=%.3f, "
+                                "R_total_ms=%.3f, V_calls=%d, V_sync_ms=%.3f, V_total_ms=%.3f)",
+                                self.device, prof[0], prof[1] / 1e6, prof[2] / 1e6,
+                                prof[3], prof[4] / 1e6, prof[5] / 1e6,
+                            )
                         with self.lock:
                             while targets:
                                 self.endpoint.release(targets[len(targets) - 1])
@@ -182,6 +249,12 @@ class Owner:
                         return
                     stream.write(b"A")
                     stream.flush()
+                    if profile_on:
+                        t2 = time.perf_counter_ns()
+                        base = 0 if command == b"R" else 3
+                        prof[base] += 1
+                        prof[base + 1] += t1 - t0
+                        prof[base + 2] += t2 - t0
         except Exception as exc:
             self._log.error("Local GDR owner session failed: %s", exc)
         finally:
@@ -263,6 +336,9 @@ def attach_routes(group, devices, tensors, host_tensors):
     leases = []
     confirmed = []
     qp_count = _qp_count()
+    h2d_qp_count = _dir_qp_count("FLEXKV_GDR_H2D_QP_COUNT", qp_count)
+    d2h_qp_count = _dir_qp_count("FLEXKV_GDR_D2H_QP_COUNT", qp_count)
+    max_sge = _max_sge()
     readbacks = int(os.environ.get("FLEXKV_GDR_READBACKS", "0"))
     if not 0 <= readbacks <= 16:
         raise ValueError("FLEXKV_GDR_READBACKS must be 0 (auto) or 1..16")
@@ -287,7 +363,15 @@ def attach_routes(group, devices, tensors, host_tensors):
             if identity is None:
                 raise RuntimeError(f"GDR: GPU {device} has no Owner views")
             path, nic, fingerprint, depth = identity
-            sender = c_ext.GdrSender(device, nic, fingerprint, depth, readbacks, qp_count)
+            sender = c_ext.GdrSender(
+                device, nic, fingerprint, depth, readbacks, qp_count,
+                h2d_qp_count, d2h_qp_count, max_sge,
+            )
+            eff_h2d_qps = getattr(sender, "h2d_qp_count", qp_count)
+            eff_d2h_qps = getattr(sender, "d2h_qp_count", qp_count)
+            eff_w_sge = getattr(sender, "write_sge_limit", 1)
+            eff_r_sge = getattr(sender, "read_sge_limit", 1)
+            eff_wr_api = int(bool(getattr(sender, "uses_wr_api", False)))
             for host in host_tensors:
                 sender.register_host(host)
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -307,8 +391,17 @@ def attach_routes(group, devices, tensors, host_tensors):
             if conn.recv(1) != b"A":
                 raise RuntimeError("GDR: Owner did not confirm the lease")
             confirmed.append(conn)
-            flexkv_logger.info("Local GDR route ready: rank=%s device=%s nic=%s qps=%s read_depth=%s",
-                               rank, device, nic, qp_count, depth)
+            diag_requested = (
+                os.environ.get("FLEXKV_GDR_LOG_COUNTERS") == "1"
+                or os.environ.get("FLEXKV_GDR_PROFILE") == "1"
+            )
+            emit = (lambda m, *a: _emit_diag(flexkv_logger, m, *a)) if diag_requested else flexkv_logger.info
+            emit(
+                "Local GDR route ready: rank=%s device=%s nic=%s qps=%s(h2d=%s,d2h=%s) "
+                "read_depth=%s sge=(w=%s,r=%s) wr_api=%s",
+                rank, device, nic, qp_count, eff_h2d_qps, eff_d2h_qps,
+                depth, eff_w_sge, eff_r_sge, eff_wr_api,
+            )
     except BaseException:
         try:
             close_routes(group, confirmed)

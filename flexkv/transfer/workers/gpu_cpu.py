@@ -433,12 +433,17 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             return
         leases = getattr(self, "_local_gdr_leases", None)
         if leases:
-            from flexkv.transfer.local_gdr import close_routes
+            from flexkv.transfer.local_gdr import _emit_diag, close_routes
 
             if os.environ.get("FLEXKV_GDR_LOG_COUNTERS") == "1":
-                flexkv_logger.info("Local GDR route counters (H2D bytes, D2H bytes, "
-                                   "payload WRs, posts, CQEs, read-backs, per-QP payload WRs): %s",
-                                   self.region_batch.gdr_counters())
+                _emit_diag(flexkv_logger, "Local GDR route counters (H2D bytes, D2H bytes, "
+                           "payload WRs, posts, CQEs, read-backs, per-QP payload WRs): %s",
+                           self.region_batch.gdr_counters())
+            if os.environ.get("FLEXKV_GDR_PROFILE") == "1" and hasattr(self.region_batch, "gdr_profile"):
+                _emit_diag(flexkv_logger, "Local GDR route profile (H2D[calls,dispatch_ns,post_ns,poll_ns,"
+                           "owner_wait_ns,sleep_ns,sleep_cnt,notify_ns,first_ms_ns,total_ns],"
+                           "D2H[same]): %s",
+                           self.region_batch.gdr_profile())
             close_routes(self.region_batch, leases)
             leases.clear()
             self._local_gdr_views.clear()
@@ -1502,6 +1507,18 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         self._log_transfer_performance(
             transfer_op, transfer_size, start_time, end_time)
         return True
+
+    def _begin_transfer_batch(self, batch_ops) -> None:
+        if self.region_batch is not None and hasattr(self.region_batch, "begin_d2h_batch"):
+            if any(
+                isinstance(op, WorkerTransferOp) and op.transfer_type == TransferType.D2H
+                for op in batch_ops
+            ):
+                self.region_batch.begin_d2h_batch()
+
+    def _end_transfer_batch(self) -> None:
+        if self.region_batch is not None and hasattr(self.region_batch, "end_d2h_batch"):
+            self.region_batch.end_d2h_batch()
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         if isinstance(transfer_op, WorkerLayerwiseTransferOp):

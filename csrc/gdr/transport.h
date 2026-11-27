@@ -49,7 +49,8 @@ class Transport {
 public:
   Transport(int device, bool sender, const std::string &nic,
             const std::string &required_endpoint, int read_depth, int readbacks,
-            size_t qp_count = 1);
+            size_t qp_count = 1, size_t h2d_qp_count = 0, size_t d2h_qp_count = 0,
+            int max_sge = 0);
   ~Transport();
   Transport(const Transport &) = delete;
   Transport &operator=(const Transport &) = delete;
@@ -60,12 +61,19 @@ public:
   const std::string &endpoint() const;
   const std::string &nic() const;
   int read_depth() const;
+  size_t h2d_qp_count() const;
+  size_t d2h_qp_count() const;
+  int write_sge_limit() const;
+  int read_sge_limit() const;
+  bool uses_wr_api() const;
   std::vector<uint32_t> sender_qpns() const;
   uint32_t accept(uint32_t sender);
   void release(uint32_t target);
   void connect(const std::vector<uint32_t> &targets, std::vector<RemoteRegion> regions);
 
   size_t resolve(uintptr_t host, uintptr_t device, size_t bytes, bool h2d, Span &out);
+  size_t resolve_chunk(uintptr_t host, uintptr_t device, size_t bytes, uint64_t route_key,
+                       Span &out, bool h2d = true);
   size_t post_payload(const Span *spans, size_t count, bool h2d);
   bool finish_scope(TransferCheckpoint &checkpoint);
   bool is_complete(const TransferCheckpoint &checkpoint) const;

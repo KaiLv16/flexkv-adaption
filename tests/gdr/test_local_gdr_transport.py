@@ -16,16 +16,22 @@ class LocalGdrTransportTest(unittest.TestCase):
         csrc = fixture.parents[1] / "csrc"
         with tempfile.TemporaryDirectory() as temp:
             for backend in ("native", "mapped"):
-                with self.subTest(backend=backend):
-                    binary = Path(temp) / backend
-                    flags = ["-DFLEXKV_GDR_MAPPED"] if backend == "mapped" else []
-                    subprocess.run([
-                        compiler, "-std=c++11", "-pedantic-errors", "-pthread", *flags,
-                        "-I", str(fixture / "fakes"), "-I", str(csrc),
-                        str(fixture / "transport_contract.cpp"), "-o", str(binary),
-                    ], check=True, timeout=30)
-                    for fault in ("", "partial", "sequence", "wc"):
-                        subprocess.run([str(binary), fault], check=True, timeout=5)
+                for wr_api in (False, True):
+                    label = f"{backend}-{'wrex' if wr_api else 'postsend'}"
+                    with self.subTest(backend=label):
+                        binary = Path(temp) / label
+                        flags = []
+                        if backend == "mapped":
+                            flags.append("-DFLEXKV_GDR_MAPPED")
+                        if wr_api:
+                            flags.append("-DFLEXKV_GDR_WR_API")
+                        subprocess.run([
+                            compiler, "-std=c++11", "-pedantic-errors", "-pthread", *flags,
+                            "-I", str(fixture / "fakes"), "-I", str(csrc),
+                            str(fixture / "transport_contract.cpp"), "-o", str(binary),
+                        ], check=True, timeout=30)
+                        for fault in ("", "partial", "sequence", "wc"):
+                            subprocess.run([str(binary), fault], check=True, timeout=5)
 
 
 if __name__ == "__main__":

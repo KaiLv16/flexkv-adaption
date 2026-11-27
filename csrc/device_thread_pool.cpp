@@ -5,9 +5,87 @@
 #include "device_thread_pool.h"
 #include "cuda_stream_lifetime.h"
 
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <stdexcept>
+#include <string>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 namespace flexkv {
+namespace {
+
+void bind_thread_to_device_numa(int device_id) noexcept {
+#ifdef __linux__
+  const char *enable = std::getenv("FLEXKV_ENABLE_NUMA_BIND");
+  const char *disable = std::getenv("FLEXKV_DISABLE_NUMA_BIND");
+  if (!enable || std::strcmp(enable, "1") != 0 ||
+      (disable && std::strcmp(disable, "1") == 0)) {
+    return;
+  }
+  char pci_bus_id[32] = {0};
+  if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), device_id) != cudaSuccess) {
+    cudaGetLastError();
+    return;
+  }
+  std::string bdf(pci_bus_id);
+  for (char &ch : bdf) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  std::ifstream cpulist_file("/sys/bus/pci/devices/" + bdf + "/local_cpulist");
+  std::string cpulist;
+  if (!cpulist_file.is_open() || !std::getline(cpulist_file, cpulist) || cpulist.empty()) {
+    return;
+  }
+
+  cpu_set_t local_mask;
+  CPU_ZERO(&local_mask);
+  size_t pos = 0;
+  while (pos < cpulist.size()) {
+    size_t comma = cpulist.find(',', pos);
+    std::string token = cpulist.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+    pos = (comma == std::string::npos) ? cpulist.size() : comma + 1;
+    if (token.empty()) {
+      continue;
+    }
+    size_t dash = token.find('-');
+    char *endptr = nullptr;
+    long first = std::strtol(token.c_str(), &endptr, 10);
+    if (endptr == token.c_str() || first < 0) {
+      continue;
+    }
+    long last = first;
+    if (dash != std::string::npos) {
+      const char *rhs = token.c_str() + dash + 1;
+      last = std::strtol(rhs, &endptr, 10);
+      if (endptr == rhs || last < first) {
+        continue;
+      }
+    }
+    for (long cpu = first; cpu <= last && cpu < CPU_SETSIZE; ++cpu) {
+      CPU_SET(static_cast<int>(cpu), &local_mask);
+    }
+  }
+
+  cpu_set_t allowed_mask;
+  CPU_ZERO(&allowed_mask);
+  if (sched_getaffinity(0, sizeof(allowed_mask), &allowed_mask) != 0) {
+    return;
+  }
+  cpu_set_t target_mask;
+  CPU_AND(&target_mask, &local_mask, &allowed_mask);
+  if (CPU_COUNT(&target_mask) > 0) {
+    sched_setaffinity(0, sizeof(target_mask), &target_mask);
+  }
+#else
+  (void)device_id;
+#endif
+}
+
+}  // namespace
 
 DeviceThreadPool::DeviceThreadPool(const std::vector<int> &device_ids)
     : device_ids_(device_ids) {
@@ -48,8 +126,9 @@ DeviceThreadPool::DeviceThreadPool(const std::vector<int> &device_ids)
   for (int i = 0; i < n; ++i) {
     threads_.emplace_back([this, i]() {
       // Once, for the life of the thread. Every task that runs here inherits
-      // the right device without touching it.
+      // the right device and PCIe-local CPU affinity without touching it.
       cudaSetDevice(device_ids_[i]);
+      bind_thread_to_device_numa(device_ids_[i]);
       while (true) {
         Task task;
         {

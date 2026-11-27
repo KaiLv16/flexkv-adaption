@@ -87,17 +87,20 @@ struct Transport::Impl {
     bool signaled;
   };
 
-  static constexpr size_t kPostBatch = 16;
   static constexpr size_t kScratchStride = 64;
   static constexpr size_t kMaxFences = 16;
+  static constexpr size_t kMaxSge = 16;
   static constexpr size_t kScratchBytes = kMaxFences * kScratchStride;
   static constexpr unsigned kQpIndexBits = 4;
   static_assert(kMaxQps == (1u << kQpIndexBits), "QP index must fit in WR id");
 
   struct Queue {
     ibv_qp *qp = nullptr;
-    std::array<ibv_send_wr, kPostBatch> wrs{};
-    std::array<ibv_sge, kPostBatch> sges{};
+#ifdef FLEXKV_GDR_WR_API
+    ibv_qp_ex *qp_ex = nullptr;
+#endif
+    std::vector<ibv_send_wr> wrs;
+    std::vector<ibv_sge> sges;
     std::vector<Operation> ledger;
     std::array<bool, kMaxFences> scratch_used{};
     Span last_write{};
@@ -124,6 +127,11 @@ struct Transport::Impl {
   int gid_index = 0;
   int depth = 0;
   int read_depth = 0;
+  int write_sge_limit = 1;
+  int read_sge_limit = 1;
+  size_t h2d_qps = 1;
+  size_t d2h_qps = 1;
+  bool use_wr_api = false;
   uint64_t max_mr_size = 0;
   bool sender = false;
   bool connected = false;
@@ -155,21 +163,74 @@ struct Transport::Impl {
     throw UnsafeTransfer("GDR: " + message);
   }
 
-  ibv_qp *create() {
-    ibv_qp_init_attr attr{};
-    attr.send_cq = cq;
-    attr.recv_cq = cq;
-    attr.qp_type = IBV_QPT_RC;
-    attr.cap.max_send_wr = depth;
-    attr.cap.max_recv_wr = 1;
-    attr.cap.max_send_sge = attr.cap.max_recv_sge = 1;
-    auto *result = ibv_create_qp(pd, &attr);
-    require(result, "create_qp failed");
-    if (attr.cap.max_send_wr < static_cast<unsigned int>(depth)) {
-      ibv_destroy_qp(result);
-      throw std::runtime_error("GDR: provider reduced SQ capacity");
+#ifdef FLEXKV_GDR_WR_API
+  ibv_qp *create(int requested_send_sge = 1, int *actual_send_sge = nullptr,
+                 ibv_qp_ex **out_qp_ex = nullptr) {
+#else
+  ibv_qp *create(int requested_send_sge = 1, int *actual_send_sge = nullptr) {
+#endif
+    int try_sge = std::max(1, requested_send_sge);
+    while (true) {
+      ibv_qp_init_attr attr{};
+      attr.send_cq = cq;
+      attr.recv_cq = cq;
+      attr.qp_type = IBV_QPT_RC;
+      attr.cap.max_send_wr = depth;
+      attr.cap.max_recv_wr = 1;
+      attr.cap.max_send_sge = static_cast<unsigned>(try_sge);
+      attr.cap.max_recv_sge = 1;
+#ifdef FLEXKV_GDR_WR_API
+      if (out_qp_ex && use_wr_api) {
+        ibv_qp_init_attr_ex ex{};
+        ex.send_cq = cq;
+        ex.recv_cq = cq;
+        ex.qp_type = IBV_QPT_RC;
+        ex.pd = pd;
+        ex.cap = attr.cap;
+        ex.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
+        ex.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_READ;
+        auto *q = ibv_create_qp_ex(ctx, &ex);
+        if (q) {
+          auto *qex = ibv_qp_to_qp_ex(q);
+          if (qex && ex.cap.max_send_wr >= static_cast<unsigned int>(depth) &&
+              ex.cap.max_send_sge >= static_cast<unsigned int>(try_sge)) {
+            *out_qp_ex = qex;
+            if (actual_send_sge) *actual_send_sge = try_sge;
+            return q;
+          }
+          ibv_destroy_qp(q);
+          if (!qex) {
+            use_wr_api = false;
+            try_sge = std::max(1, requested_send_sge);
+            continue;
+          }
+        } else if (errno == EOPNOTSUPP || errno == ENOSYS) {
+          use_wr_api = false;
+          try_sge = std::max(1, requested_send_sge);
+          continue;
+        }
+        if (try_sge > 1) {
+          try_sge /= 2;
+          continue;
+        }
+        use_wr_api = false;
+        try_sge = std::max(1, requested_send_sge);
+        continue;
+      }
+#endif
+      auto *result = ibv_create_qp(pd, &attr);
+      if (result && attr.cap.max_send_wr >= static_cast<unsigned int>(depth) &&
+          attr.cap.max_send_sge >= static_cast<unsigned int>(try_sge)) {
+        if (actual_send_sge) *actual_send_sge = try_sge;
+        return result;
+      }
+      if (result) ibv_destroy_qp(result);
+      if (try_sge == 1) {
+        require(result != nullptr, "create_qp failed");
+        throw std::runtime_error("GDR: provider reduced SQ capacity");
+      }
+      try_sge /= 2;
     }
-    return result;
   }
 
   void modify(ibv_qp *q,ibv_qp_attr &a,int mask,const char *stage) {
@@ -233,6 +294,36 @@ struct Transport::Impl {
   }
 
   void post(Queue &queue, size_t count) {
+#ifdef FLEXKV_GDR_WR_API
+    if (queue.qp_ex) {
+      ibv_wr_start(queue.qp_ex);
+      for (size_t i = 0; i < count; ++i) {
+        const auto &wr = queue.wrs[i];
+        queue.qp_ex->wr_id = wr.wr_id;
+        queue.qp_ex->wr_flags = static_cast<unsigned int>(wr.send_flags);
+        if (wr.opcode == IBV_WR_RDMA_READ) {
+          ibv_wr_rdma_read(queue.qp_ex, wr.wr.rdma.rkey, wr.wr.rdma.remote_addr);
+        } else {
+          ibv_wr_rdma_write(queue.qp_ex, wr.wr.rdma.rkey, wr.wr.rdma.remote_addr);
+        }
+        if (wr.num_sge == 1) {
+          const auto &sge = wr.sg_list[0];
+          ibv_wr_set_sge(queue.qp_ex, sge.lkey, sge.addr, sge.length);
+        } else {
+          ibv_wr_set_sge_list(queue.qp_ex, static_cast<size_t>(wr.num_sge), wr.sg_list);
+        }
+      }
+      const int error = ibv_wr_complete(queue.qp_ex);
+      if (error) {
+        queue.posted += count;
+        fail("ibv_wr_complete failed; count=" + std::to_string(count) +
+             ", error=" + std::to_string(error));
+      }
+      queue.posted += count;
+      ++stats.posts;
+      return;
+    }
+#endif
     ibv_send_wr *bad = nullptr;
     const int error = ibv_post_send(queue.qp, queue.wrs.data(), &bad);
     if (error) {
@@ -256,9 +347,11 @@ struct Transport::Impl {
     const auto slot = static_cast<int>(free - queue.scratch_used.begin());
     const auto seq = queue.posted + 1;
     const auto &last = queue.last_write;
+    const uint32_t rb_len = std::min(last.bytes, uint32_t(8));
+    const uint64_t rb_remote = last.remote + (last.bytes - rb_len);
     queue.sges[0] = {reinterpret_cast<uint64_t>(scratch + index * kScratchBytes +
                                                slot * kScratchStride),
-                     std::min(last.bytes, uint32_t(8)), scratch_mr->lkey};
+                     rb_len, scratch_mr->lkey};
     auto &wr = queue.wrs[0];
     wr = {};
     wr.wr_id = wr_id(seq, index);
@@ -266,7 +359,7 @@ struct Transport::Impl {
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_READ;
     wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr.rdma.remote_addr = last.remote;
+    wr.wr.rdma.remote_addr = rb_remote;
     wr.wr.rdma.rkey = last.rkey;
     queue.ledger[seq % depth] = {seq, true, 0, slot, true};
     post(queue, 1);
@@ -278,14 +371,22 @@ struct Transport::Impl {
   }
 };
 
-constexpr size_t Transport::Impl::kPostBatch;
-
 Transport::Transport(int device, bool sender, const std::string &nic,
                      const std::string &required_endpoint, int requested_depth,
-                     int requested_fences, size_t qp_count) : p_(new Impl) {
+                     int requested_fences, size_t qp_count, size_t h2d_qp_count,
+                     size_t d2h_qp_count, int max_sge) : p_(new Impl) {
   auto &e = *p_;
   require(qp_count >= 1 && qp_count <= kMaxQps, "QP count must be 1..16");
+  e.h2d_qps = h2d_qp_count ? h2d_qp_count : std::min<size_t>(qp_count, 4);
+  e.d2h_qps = d2h_qp_count ? d2h_qp_count : qp_count;
+  require(e.h2d_qps >= 1 && e.h2d_qps <= qp_count, "H2D QP count must be 1..qp_count");
+  require(e.d2h_qps >= 1 && e.d2h_qps <= qp_count, "D2H QP count must be 1..qp_count");
+  require(max_sge >= 0 && max_sge <= static_cast<int>(Impl::kMaxSge), "max_sge must be 0..16");
   e.sender = sender;
+#ifdef FLEXKV_GDR_WR_API
+  const char *wr_env = std::getenv("FLEXKV_GDR_WR_API");
+  e.use_wr_api = sender && (!wr_env || std::strcmp(wr_env, "0") != 0);
+#endif
   require(cudaSetDevice(device) == cudaSuccess, "cudaSetDevice failed");
   // Workers spawn a fresh interpreter. An Owner may already have live MRs
   // from another transport, in which case fork protection cannot be enabled
@@ -371,7 +472,24 @@ Transport::Transport(int device, bool sender, const std::string &nic,
   const int capacity = std::min({128, attr.max_qp_rd_atom, attr.max_qp_init_rd_atom});
   require(e.depth > 1 && capacity > 0 && e.port.max_msg_sz, "insufficient SQ/CQ or READ capacity");
   require(requested_depth >= 0 && requested_depth <= capacity, "invalid READ depth");
-  e.read_depth = requested_depth ? requested_depth : std::min(capacity, 16);
+  e.read_depth = requested_depth ? requested_depth : std::min(capacity, 64);
+  const int hw_write_sge = attr.max_sge > 0 ? attr.max_sge : 1;
+  const int hw_read_sge = attr.max_sge_rd > 0 ? attr.max_sge_rd : hw_write_sge;
+  int env_max_sge = max_sge;
+  if (env_max_sge == 0) {
+    if (const char *sge_env = std::getenv("FLEXKV_GDR_MAX_SGE")) {
+      char *endptr = nullptr;
+      const long parsed = std::strtol(sge_env, &endptr, 10);
+      require(endptr != sge_env && *endptr == '\0' &&
+                  parsed >= 0 && parsed <= static_cast<long>(Impl::kMaxSge),
+              "FLEXKV_GDR_MAX_SGE must be 0..16");
+      env_max_sge = static_cast<int>(parsed);
+    }
+  }
+  const int sge_cap = env_max_sge > 0 ? env_max_sge : static_cast<int>(Impl::kMaxSge);
+  const int desired_send_sge = sender
+      ? std::max(1, std::min({hw_write_sge, sge_cap, static_cast<int>(Impl::kMaxSge)}))
+      : 1;
 #ifdef FLEXKV_GDR_MAPPED
   e.fence_depth = sender && requested_fences == 0
       ? std::min({4, e.depth - 1, e.read_depth}) : requested_fences;
@@ -412,10 +530,23 @@ Transport::Transport(int device, bool sender, const std::string &nic,
     if (sender) {
       e.queues.resize(qp_count);
       e.stats.qp_payload_wrs.resize(qp_count);
+      int negotiated_sge = desired_send_sge;
       for (auto &queue : e.queues) {
-        queue.ledger.resize(e.depth);
-        queue.qp = e.create();
+        int actual_sge = 1;
+#ifdef FLEXKV_GDR_WR_API
+        queue.qp = e.create(negotiated_sge, &actual_sge, &queue.qp_ex);
+#else
+        queue.qp = e.create(negotiated_sge, &actual_sge);
+#endif
+        negotiated_sge = std::min(negotiated_sge, actual_sge);
         e.init_qp(queue.qp);
+      }
+      e.write_sge_limit = negotiated_sge;
+      e.read_sge_limit = std::max(1, std::min(hw_read_sge, negotiated_sge));
+      for (auto &queue : e.queues) {
+        queue.wrs.resize(e.depth);
+        queue.sges.resize(static_cast<size_t>(e.depth) * static_cast<size_t>(e.write_sge_limit));
+        queue.ledger.resize(e.depth);
       }
     }
     return;
@@ -509,6 +640,19 @@ const std::string &Transport::endpoint() const {
 
 const std::string &Transport::nic() const { return p_->nic_selector; }
 int Transport::read_depth() const { return p_->read_depth; }
+size_t Transport::h2d_qp_count() const { return p_->h2d_qps; }
+size_t Transport::d2h_qp_count() const { return p_->d2h_qps; }
+int Transport::write_sge_limit() const { return p_->write_sge_limit; }
+int Transport::read_sge_limit() const { return p_->read_sge_limit; }
+bool Transport::uses_wr_api() const {
+#ifdef FLEXKV_GDR_WR_API
+  return !p_->queues.empty() &&
+         std::all_of(p_->queues.begin(), p_->queues.end(),
+                     [](const Impl::Queue &q) { return q.qp_ex != nullptr; });
+#else
+  return false;
+#endif
+}
 std::vector<uint32_t> Transport::sender_qpns() const {
   std::vector<uint32_t> qpns;
   qpns.reserve(p_->queues.size());
@@ -584,14 +728,40 @@ size_t Transport::resolve(uintptr_t host, uintptr_t device, size_t bytes, bool h
       gm.bytes - device_offset, max_payload()});
   const auto remote = gm.remote + device_offset;
   size_t index = 0;
-  if (e.queues.size() > 1) {
+  const size_t active_qps = h2d ? e.h2d_qps : e.d2h_qps;
+  if (active_qps > 1) {
     // Assign by destination bytes. Overlapping writes must reach the same
     // SQ in request order, even when a later span starts at a different offset.
     constexpr size_t stripe_bytes = 64u << 10;
     const uint64_t destination = h2d ? remote : host;
     const auto stripe = destination / stripe_bytes;
-    index = (stripe ^ (stripe >> 4) ^ (stripe >> 8)) % e.queues.size();
+    index = (stripe ^ (stripe >> 4) ^ (stripe >> 8)) % active_qps;
     length = std::min(length, static_cast<size_t>(stripe_bytes - destination % stripe_bytes));
+  }
+  out = {host, remote, static_cast<uint32_t>(length), hm.mr->lkey, gm.key,
+         static_cast<uint32_t>(index)};
+  return length;
+}
+
+size_t Transport::resolve_chunk(uintptr_t host, uintptr_t device, size_t bytes,
+                                uint64_t route_key, Span &out, bool h2d) {
+  auto &e = *p_;
+  require(e.connected && bytes, "invalid transfer span");
+  auto host_base = [](const Mr &region) { return reinterpret_cast<uintptr_t>(region.ptr); };
+  const auto &hm = e.lookup(e.hosts, e.host_hint, host, host_base);
+  const auto &gm = e.lookup(e.remote_regions, e.remote_hint, device,
+                            [](const RemoteRegion &region) { return region.local; });
+  const auto device_offset = device - gm.local;
+  const size_t length = std::min({bytes, hm.bytes - (host - host_base(hm)),
+      gm.bytes - device_offset, max_payload()});
+  const auto remote = gm.remote + device_offset;
+  size_t index = 0;
+  const size_t active_qps = h2d ? e.h2d_qps : e.d2h_qps;
+  if (active_qps > 1) {
+    // Route by destination block/layer key so chunks stay unsplit across QPs
+    // while overlapping writes to the same destination still share one SQ.
+    const uint64_t mixed = route_key + (route_key >> 16) + (route_key >> 32);
+    index = mixed % active_qps;
   }
   out = {host, remote, static_cast<uint32_t>(length), hm.mr->lkey, gm.key,
          static_cast<uint32_t>(index)};
@@ -601,26 +771,69 @@ size_t Transport::resolve(uintptr_t host, uintptr_t device, size_t bytes, bool h
 size_t Transport::post_payload(const Span *spans, size_t count, bool h2d) {
   auto &e = *p_;
   require(!e.unsafe && e.connected, "route not available");
-  count = std::min(count, Impl::kPostBatch);
+  if (!h2d && e.read_depth >= 4 && count >= 4) {
+    bool all_busy = true;
+    for (size_t i = 0; i < e.d2h_qps; ++i) {
+      if (e.queues[i].reads == 0) {
+        all_busy = false;
+        break;
+      }
+    }
+    const int refill_batch = std::min(8, std::max(2, e.read_depth / 2));
+    if (all_busy && e.queues[spans[0].qp_index].reads > e.read_depth - refill_batch) {
+      return 0;
+    }
+  }
+  const int sge_limit = h2d ? e.write_sge_limit : e.read_sge_limit;
+  const size_t payload_limit = max_payload();
   std::array<size_t, kMaxQps> counts{};
+  std::array<size_t, kMaxQps> sge_counts{};
   std::array<size_t, kMaxQps> bytes{};
   size_t actual = 0;
   for (; actual < count; ++actual) {
     const auto &span = spans[actual];
     const auto index = span.qp_index;
+    require(index < e.queues.size() && span.bytes > 0 && span.bytes <= payload_limit,
+            "invalid payload span");
     auto &queue = e.queues[index];
+    if (queue.payload_bytes + bytes[index] + span.bytes > (16u << 20)) break;
     auto &slot = counts[index];
+    if (slot > 0) {
+      auto &tail_wr = queue.wrs[slot - 1];
+      const uint64_t tail_seq = queue.posted + slot;
+      auto &tail_op = queue.ledger[tail_seq % e.depth];
+      if (tail_wr.wr.rdma.rkey == span.rkey &&
+          tail_wr.wr.rdma.remote_addr + tail_op.bytes == span.remote &&
+          span.bytes <= payload_limit - tail_op.bytes) {
+        auto &last_sge = queue.sges[sge_counts[index] - 1];
+        if (last_sge.lkey == span.lkey && last_sge.addr + last_sge.length == span.host) {
+          last_sge.length += span.bytes;
+          tail_op.bytes += span.bytes;
+          bytes[index] += span.bytes;
+          if (h2d && e.fence_depth) queue.last_write = span;
+          continue;
+        }
+        if (tail_wr.num_sge < sge_limit) {
+          queue.sges[sge_counts[index]++] = {span.host, span.bytes, span.lkey};
+          ++tail_wr.num_sge;
+          tail_op.bytes += span.bytes;
+          bytes[index] += span.bytes;
+          if (h2d && e.fence_depth) queue.last_write = span;
+          continue;
+        }
+      }
+    }
     const size_t reserved = h2d ? e.fence_depth - queue.fences : 0;
     const auto inflight = queue.posted - queue.retired;
     if (inflight + slot >= e.depth - reserved ||
-        (!h2d && slot >= static_cast<size_t>(e.read_depth - queue.reads)) ||
-        queue.payload_bytes + bytes[index] + span.bytes > (16u << 20)) break;
+        (!h2d && slot >= static_cast<size_t>(e.read_depth - queue.reads))) break;
     const uint64_t seq = queue.posted + slot + 1;
-    queue.sges[slot] = {span.host, span.bytes, span.lkey};
+    auto *sg_start = &queue.sges[sge_counts[index]];
+    queue.sges[sge_counts[index]++] = {span.host, span.bytes, span.lkey};
     auto &wr = queue.wrs[slot];
     wr = {};
     wr.wr_id = e.wr_id(seq, index);
-    wr.sg_list = &queue.sges[slot];
+    wr.sg_list = sg_start;
     wr.num_sge = 1;
     wr.opcode = h2d ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
     wr.send_flags = h2d ? 0 : IBV_SEND_SIGNALED;
@@ -674,8 +887,8 @@ bool Transport::is_complete(const TransferCheckpoint &checkpoint) const {
 int Transport::poll() {
   auto &e = *p_;
   if (!has_outstanding()) return 0;
-  ibv_wc wc[32];
-  const int count = ibv_poll_cq(e.cq, 32, wc);
+  ibv_wc wc[64];
+  const int count = ibv_poll_cq(e.cq, 64, wc);
   if (count < 0) e.fail("poll_cq failed");
   for (int i = 0; i < count; ++i) {
     if (wc[i].status != IBV_WC_SUCCESS)

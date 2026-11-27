@@ -199,7 +199,10 @@ public:
   void install_gdr_route(int rank, std::unique_ptr<gdr::Transport> sender, int fd);
   void close_gdr();
   void stop_gdr() { gdr_stopped_.store(true, std::memory_order_release); }
+  void begin_d2h_batch() noexcept;
+  void end_d2h_batch() noexcept;
   std::vector<std::vector<uint64_t>> gdr_counters() const;
+  std::vector<std::vector<uint64_t>> gdr_profile() const;
 #endif
   // Re-point one region's device tensors after a GPU hot remap.  Drains
   // first: the old pointers may still be in flight.
