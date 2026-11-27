@@ -6,6 +6,7 @@ worker each; ``op.pool_id`` selects which. Layerwise (per-layer eventfd)
 delivery is a completion contract on this worker, not a separate class.
 """
 
+import os
 import time
 from dataclasses import dataclass, field
 from itertools import groupby
@@ -1422,9 +1423,67 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             transfer_op, transfer_size, start_time, end_time)
         return True
 
+    def _can_coalesce_d2h_op(self, transfer_op: WorkerTransferOp) -> bool:
+        if isinstance(transfer_op, WorkerLayerwiseTransferOp):
+            return False
+        if not self._use_region_batch() or getattr(self, "_backend", None) is not None:
+            return False
+        pool = self._pool_for(transfer_op)
+        return self._is_per_group(pool) or isinstance(self._compressor, NullCompressionStrategy)
+
+    def _resolve_op_blocks_for_coalesce(self, transfer_op: WorkerTransferOp):
+        if (transfer_op.src_slot_id >= 0 or transfer_op.dst_slot_id >= 0) and not self._op_buffer_pinned:
+            self._ensure_cuda_device(self._device_ids[0])
+            self._pin_op_buffer()
+        return self.get_transfer_block_ids(transfer_op)
+
+    def _run_coalesced_d2h(self, pool_id: PoolId, src_block_ids, dst_block_ids, ops) -> None:
+        pool = self._pools[pool_id]
+        start_time = time.time()
+        self._transfer_impl(
+            src_block_ids,
+            dst_block_ids,
+            TransferType.D2H,
+            pool=pool,
+        )
+        end_time = time.time()
+        unit_bytes = (
+            pool.chunk_layer_bytes * self.kv_dim
+            if self._is_per_group(pool)
+            else pool.bytes_per_block
+        )
+        for member in ops:
+            self._log_transfer_performance(
+                member,
+                unit_bytes * member.valid_block_num,
+                start_time,
+                end_time,
+            )
+
+    def _batch_drain_timeout_s(self, first_op) -> float:
+        if not (isinstance(first_op, WorkerTransferOp) and first_op.transfer_type == TransferType.D2H):
+            return 0.0
+        if os.environ.get("FLEXKV_D2H_COALESCE", "1").strip() == "0":
+            return 0.0
+        window_us = int(os.environ.get("FLEXKV_D2H_COALESCE_WINDOW_US", "0"))
+        return window_us * 1e-6 if window_us > 0 else 0.0
+
+    def _begin_transfer_batch(self, batch_ops) -> None:
+        if len(batch_ops) > 1 and self._use_region_batch():
+            from flexkv.transfer.d2h_coalesce import attach_d2h_coalesce_groups
+
+            attach_d2h_coalesce_groups(
+                batch_ops,
+                self._can_coalesce_d2h_op,
+                self._resolve_op_blocks_for_coalesce,
+            )
+
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         if isinstance(transfer_op, WorkerLayerwiseTransferOp):
             return self._launch_layerwise(transfer_op)
+        coalesce_group = getattr(transfer_op, "_d2h_coalesce_group", None)
+        if coalesce_group is not None:
+            return coalesce_group.execute(self._run_coalesced_d2h, transfer_op)
         # Keep the unified worker safe if a whole-op transfer is sent to a
         # PER_LAYER instance. Register before exposing shared-slot ID views;
         # direct-ID inputs are independently pinned by get_transfer_block_ids.

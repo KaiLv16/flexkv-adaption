@@ -8,7 +8,7 @@ import threading
 import time
 from contextlib import suppress
 from multiprocessing.connection import Connection
-from typing import Any, Union
+from typing import Any, List, Union
 
 import torch.multiprocessing as mp
 
@@ -75,6 +75,33 @@ class WorkerHandle:
                 self._remote_sender.submit(worker_op)
             except (SenderClosed, SenderFull) as exc:
                 self._fail_unsent(worker_op, exc)
+
+    def submit_transfer_batch(
+        self, ops: List[Union[TransferOp, LayerwiseTransferOp]]
+    ) -> None:
+        if not ops:
+            return
+        if len(ops) == 1 or self._remote_sender is not None:
+            for op in ops:
+                self.submit_transfer(op)
+            return
+        timing_on = trace.timing_enabled()
+        trace_on = bool(trace._TRACE_ON)
+        submitted_ns = time.perf_counter_ns() if timing_on else 0
+        worker_ops = []
+        for op in ops:
+            worker_op = (
+                WorkerLayerwiseTransferOp(op)
+                if isinstance(op, LayerwiseTransferOp)
+                else WorkerTransferOp(op)
+            )
+            if timing_on:
+                worker_op.prof_submitted_ns = submitted_ns
+                trace.set_submit_ns(op.op_id, submitted_ns)
+            if trace_on:
+                trace.inc_inflight()
+            worker_ops.append(worker_op)
+        self.transfer_conn.send(worker_ops)
 
     def control(
         self, command: str, payload: Any = None, timeout: float = 120.0

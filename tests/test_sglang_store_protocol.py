@@ -1,4 +1,5 @@
 from array import array
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -632,3 +633,166 @@ def test_draft_store_notification_failure_without_launch_has_no_task():
         connector.store_kv("request", range(4), torch.arange(4))
     assert not connector._inflight_stores
     connector.kv_manager.launch.assert_not_called()
+
+
+def _make_batch_leader_connector(page_size: int = 64):
+    connector = _follower_connector(None)
+    connector.page_size = page_size
+    connector._cache_layer_split = True
+    connector._sync_ctx.is_sync_leader = True
+    connector._sync_ctx.cp_agrees = MagicMock(return_value=True)
+    connector._sync_ctx.barrier = MagicMock()
+    connector._sync_ctx.scatter.side_effect = lambda value, **_: value
+    connector._swa_kv_pool = None
+    connector._cache_namespace = lambda ns: ns
+    connector._store_profile_scope = lambda _name: nullcontext()
+    connector._slot_signature = lambda slots: slots.cpu().numpy().tobytes()
+    connector._to_cpu_int64 = lambda t: t.cpu().to(torch.int64)
+    connector._build_swa_slot_mapping = lambda _t: None
+    connector.tp_client = None
+    connector.kv_manager = MagicMock()
+    return connector
+
+
+def test_store_kv_batch_coalesces_small_requests_into_single_launch_and_scatter():
+    connector = _make_batch_leader_connector(page_size=64)
+    tids = iter([101, 102, 103, 104])
+    connector.kv_manager.put_match.side_effect = lambda **kw: (
+        next(tids),
+        np.ones(len(kw["token_ids"]), dtype=np.bool_),
+        PutMatchDisposition.READS_GPU,
+    )
+    items = [(f"r{i}", range(128), torch.arange(128)) for i in range(4)]
+
+    results = connector.store_kv_batch_with_result(items)
+
+    assert [r.task_id for r in results] == [101, 102, 103, 104]
+    assert connector.kv_manager.launch.call_count == 1
+    assert connector.kv_manager.launch.call_args.kwargs["task_ids"] == [101, 102, 103, 104]
+    connector._sync_ctx.scatter.assert_called_once()
+    assert connector._inflight_stores == {"r0": 101, "r1": 102, "r2": 103, "r3": 104}
+
+
+def test_store_kv_batch_flushes_large_requests_incrementally_with_single_scatter():
+    connector = _make_batch_leader_connector(page_size=64)
+    events = []
+    tids = iter([201, 202, 203, 204])
+
+    def _put_match(**kw):
+        tid = next(tids)
+        events.append(("put_match", tid))
+        return tid, np.ones(len(kw["token_ids"]), dtype=np.bool_), PutMatchDisposition.READS_GPU
+
+    def _launch(**kw):
+        events.append(("launch", list(kw["task_ids"])))
+        return list(kw["task_ids"])
+
+    connector.kv_manager.put_match.side_effect = _put_match
+    connector.kv_manager.launch.side_effect = _launch
+    items = [(f"r{i}", range(4096), torch.arange(4096)) for i in range(4)]
+
+    results = connector.store_kv_batch_with_result(items)
+
+    assert [r.task_id for r in results] == [201, 202, 203, 204]
+    assert events == [
+        ("put_match", 201),
+        ("launch", [201]),
+        ("put_match", 202),
+        ("launch", [202]),
+        ("put_match", 203),
+        ("launch", [203]),
+        ("put_match", 204),
+        ("launch", [204]),
+    ]
+    connector._sync_ctx.scatter.assert_called_once()
+
+
+def test_store_kv_batch_stops_after_partial_launch_failure():
+    connector = _make_batch_leader_connector(page_size=64)
+    tids = iter([301, 302, 303])
+    connector.kv_manager.put_match.side_effect = lambda **kw: (
+        next(tids),
+        np.ones(len(kw["token_ids"]), dtype=np.bool_),
+        PutMatchDisposition.READS_GPU,
+    )
+    connector.kv_manager.launch.side_effect = [[301], OSError("launch boom")]
+    items = [(f"r{i}", range(4096), torch.arange(4096)) for i in range(3)]
+
+    with pytest.raises(StoreSubmissionUncertainError, match="launch boom"):
+        connector.store_kv_batch_with_result(items)
+
+    assert connector.kv_manager.put_match.call_count == 2
+    assert connector.kv_manager.launch.call_count == 2
+    assert connector._inflight_stores == {"r0": 301, "r1": 302}
+    connector._sync_ctx.scatter.assert_called_once()
+
+
+def test_store_kv_batch_edge_cases_empty_single_mixed_cp_abort_and_follower():
+    connector = _make_batch_leader_connector(page_size=64)
+    assert connector.store_kv_batch_with_result([]) == []
+
+    # Single-item batch delegates directly to store_kv_with_result
+    connector.store_kv_with_result = MagicMock(return_value=MagicMock(task_id=99))
+    single = connector.store_kv_batch_with_result([("r0", range(64), torch.arange(64), "req0", ["ns"])])
+    assert len(single) == 1 and single[0].task_id == 99
+    connector.store_kv_with_result.assert_called_once()
+    del connector.store_kv_with_result
+
+    # Mixed cached, partial-block short item, and active item
+    connector.kv_manager.put_match.side_effect = [
+        (-1, np.zeros(64, dtype=np.bool_), PutMatchDisposition.ALREADY_CACHED),
+        (401, np.ones(64, dtype=np.bool_), PutMatchDisposition.READS_GPU),
+    ]
+    mixed = connector.store_kv_batch_with_result([
+        ("r-cached", range(64), torch.arange(64)),
+        ("r-short", range(32), torch.arange(32)),
+        ("r-active", range(64), torch.arange(64)),
+    ])
+    assert mixed[0].already_cached and mixed[0].task_id == -1
+    assert mixed[1].task_id == -1 and not mixed[1].already_cached
+    assert mixed[2].task_id == 401 and mixed[2].reads_gpu
+    assert connector.kv_manager.launch.call_args.kwargs["task_ids"] == [401]
+
+    # CP disagreement aborts the whole batch cleanly
+    connector = _make_batch_leader_connector(page_size=64)
+    connector._sync_ctx.cp_agrees.return_value = False
+    aborted = connector.store_kv_batch_with_result([
+        ("a", range(64), torch.arange(64)),
+        ("b", range(64), torch.arange(64)),
+    ])
+    assert all(r.task_id == -1 for r in aborted)
+    connector.kv_manager.put_match.assert_not_called()
+
+    # Non-split mode rejects mismatched lengths loudly
+    non_split = _make_batch_leader_connector(page_size=64)
+    non_split._cache_layer_split = False
+    with pytest.raises(ValueError, match="has 64 entries"):
+        non_split.store_kv_batch_with_result([
+            ("a", range(64), torch.arange(32)),
+            ("b", range(64), torch.arange(64)),
+        ])
+
+    # Follower receives scattered batch results and raises StoreSubmissionUncertainError on failure
+    follower = _follower_connector({
+        "items": [
+            {"rid": "f0", "task_id": 501, "active": True, "already_cached": False, "reads_gpu": True, "slot_count": 64},
+            {"rid": "f1", "task_id": -1, "active": False, "already_cached": True, "reads_gpu": False, "slot_count": 64},
+        ]
+    })
+    follower.page_size = 64
+    follower._cache_layer_split = False
+    f_res = follower.store_kv_batch_with_result([
+        ("f0", range(64), torch.arange(64)),
+        ("f1", range(64), torch.arange(64)),
+    ])
+    assert [(r.task_id, r.reads_gpu, r.already_cached) for r in f_res] == [
+        (501, True, False), (-1, False, True)
+    ]
+    assert follower._inflight_stores == {"f0": 501}
+
+    follower._sync_ctx.scatter.side_effect = OSError("scatter lost")
+    with pytest.raises(StoreSubmissionUncertainError, match="scatter lost"):
+        follower.store_kv_batch_with_result([
+            ("f2", range(64), torch.arange(64)),
+            ("f3", range(64), torch.arange(64)),
+        ])

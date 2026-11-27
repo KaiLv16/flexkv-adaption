@@ -1838,7 +1838,20 @@ class KVTaskEngine(KVTaskManager):
             import uuid
             coordinator.epoch = uuid.uuid4().hex
             coordinator.accepting = True
+        self._update_tasks(timeout=0.0)
         ongoing = sum(1 for t in list(self.tasks.values()) if not t.is_completed())
+        if ongoing:
+            deadline = time.monotonic() + 0.2
+            while ongoing and time.monotonic() < deadline:
+                if not any(
+                    t.task_end_op_finished and not t.is_completed()
+                    for t in self.tasks.values()
+                ):
+                    self._update_tasks(timeout=0.01)
+                    ongoing = sum(1 for t in list(self.tasks.values()) if not t.is_completed())
+                    break
+                self._update_tasks(timeout=0.01)
+                ongoing = sum(1 for t in list(self.tasks.values()) if not t.is_completed())
         if ongoing:
             raise RuntimeError(f"reset_cache requires drained transfers; {ongoing} task(s) active")
 

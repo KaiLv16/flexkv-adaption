@@ -104,6 +104,25 @@ _WORKER_IDLE_POLL_S = float(os.getenv("FLEXKV_WORKER_IDLE_POLL_S", "0.05"))
 _undrained_host_regions: List[List[Tuple[torch.Tensor, str]]] = []
 
 
+def _append_received_payload(
+    batch_ops: List[Any], payload: Any, received_ns: int
+) -> bool:
+    if payload is None:
+        return True
+    if isinstance(payload, list):
+        for item in payload:
+            if item is None:
+                return True
+            if not isinstance(item, dict):
+                item._received_ns = received_ns
+            batch_ops.append(item)
+        return False
+    if not isinstance(payload, dict):
+        payload._received_ns = received_ns
+    batch_ops.append(payload)
+    return False
+
+
 class TransferWorkerBase(ABC):
     _worker_id_counter = 0
     _worker_id_lock = threading.Lock()
@@ -652,13 +671,34 @@ class TransferWorkerBase(ABC):
                 op = self.transfer_conn.recv()
                 if op is None:
                     return
-                if not isinstance(op, dict):
-                    op._received_ns = time.perf_counter_ns()
-
-                batch_ops = [op]
-                stop_after_batch = False
+                batch_ops: List[Any] = []
+                stop_after_batch = _append_received_payload(
+                    batch_ops, op, time.perf_counter_ns()
+                )
+                if not batch_ops and stop_after_batch:
+                    return
                 drain_failed = False
-                while self.transfer_conn.poll(timeout=0):
+                drain_timeout_fn = getattr(self, "_batch_drain_timeout_s", None)
+                linger_s = (
+                    drain_timeout_fn(batch_ops[0])
+                    if (
+                        drain_timeout_fn is not None
+                        and len(batch_ops) == 1
+                        and not stop_after_batch
+                    )
+                    else 0.0
+                )
+                deadline = (time.perf_counter() + linger_s) if linger_s > 0.0 else 0.0
+                while not stop_after_batch:
+                    has_more = self.transfer_conn.poll(timeout=0)
+                    if not has_more and deadline > 0.0:
+                        remaining = deadline - time.perf_counter()
+                        if remaining > 0.0:
+                            has_more = self.transfer_conn.poll(timeout=remaining)
+                        else:
+                            deadline = 0.0
+                    if not has_more:
+                        break
                     # A failure while draining must not discard the ops
                     # already received: fall through and process the batch,
                     # then let the outer handler deal with the pipe.
@@ -678,111 +718,116 @@ class TransferWorkerBase(ABC):
                         )
                         drain_failed = True
                         break
-                    if op is None:
+                    if _append_received_payload(batch_ops, op, time.perf_counter_ns()):
                         stop_after_batch = True
                         break
-                    if not isinstance(op, dict):
-                        op._received_ns = time.perf_counter_ns()
-                    batch_ops.append(op)
-                launch_batch = getattr(self, "_launch_transfer_batch", None)
-                batch_results = launch_batch(batch_ops) if launch_batch else None
-                for op in batch_ops:
-                    if isinstance(op, dict) and op.get("type") == "control":
-                        self._reply_control(op)
-                        continue
-                    transfer_status = False
-                    transfer_start_ns = time.perf_counter_ns()
-                    nvtx_pushed = False
-                    try:
-                        nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
-                                            f"graph_id: {op.transfer_graph_id}",
-                                            color=get_nvtx_range_color(op.transfer_graph_id))
-                        nvtx_pushed = True
+                begin_batch = getattr(self, "_begin_transfer_batch", None)
+                end_batch = getattr(self, "_end_transfer_batch", None)
+                if begin_batch is not None:
+                    begin_batch(batch_ops)
+                try:
+                    launch_batch = getattr(self, "_launch_transfer_batch", None)
+                    batch_results = launch_batch(batch_ops) if launch_batch else None
+                    for op in batch_ops:
+                        if isinstance(op, dict) and op.get("type") == "control":
+                            self._reply_control(op)
+                            continue
+                        transfer_status = False
+                        transfer_start_ns = time.perf_counter_ns()
+                        nvtx_pushed = False
+                        try:
+                            nvtx.push_range(f"launch {op.transfer_type.name} op_id: {op.transfer_op_id}, "
+                                                f"graph_id: {op.transfer_graph_id}",
+                                                color=get_nvtx_range_color(op.transfer_graph_id))
+                            nvtx_pushed = True
+                            if batch_results and op.transfer_op_id in batch_results:
+                                transfer_status, transfer_start_ns, _ = batch_results[op.transfer_op_id]
+                            else:
+                                transfer_status = self.launch_transfer(op)
+                        except Exception as e:
+                            is_layerwise = op.transfer_type == TransferType.LAYERWISE
+                            direction = "H2D" if is_layerwise else op.transfer_type.value
+                            blocks = (
+                                len(op.src_block_ids_h2d)
+                                if is_layerwise
+                                else op.valid_block_num
+                            )
+                            flexkv_logger.error(
+                                "[FlexKV-IO] operation=transfer act=complete "
+                                "status=failed direction=%s blocks=%d op_id=%d "
+                                "graph_id=%d mode=%s transfer_time=%.4fs "
+                                "error=%r",
+                                direction,
+                                blocks,
+                                op.transfer_op_id,
+                                op.transfer_graph_id,
+                                "layerwise" if is_layerwise else "no-layerwise",
+                                (time.perf_counter_ns() - transfer_start_ns) / 1e9,
+                                str(e),
+                                exc_info=True,
+                            )
+                        finally:
+                            if nvtx_pushed:
+                                nvtx.pop_range()
+                        launched_ns = time.perf_counter_ns()
                         if batch_results and op.transfer_op_id in batch_results:
-                            transfer_status, transfer_start_ns, _ = batch_results[op.transfer_op_id]
-                        else:
-                            transfer_status = self.launch_transfer(op)
-                    except Exception as e:
-                        is_layerwise = op.transfer_type == TransferType.LAYERWISE
-                        direction = "H2D" if is_layerwise else op.transfer_type.value
-                        blocks = (
-                            len(op.src_block_ids_h2d)
-                            if is_layerwise
-                            else op.valid_block_num
-                        )
-                        flexkv_logger.error(
-                            "[FlexKV-IO] operation=transfer act=complete "
-                            "status=failed direction=%s blocks=%d op_id=%d "
-                            "graph_id=%d mode=%s transfer_time=%.4fs "
-                            "error=%r",
-                            direction,
-                            blocks,
-                            op.transfer_op_id,
-                            op.transfer_graph_id,
-                            "layerwise" if is_layerwise else "no-layerwise",
-                            (time.perf_counter_ns() - transfer_start_ns) / 1e9,
-                            str(e),
-                            exc_info=True,
-                        )
-                    finally:
-                        if nvtx_pushed:
-                            nvtx.pop_range()
-                    launched_ns = time.perf_counter_ns()
-                    if batch_results and op.transfer_op_id in batch_results:
-                        launched_ns = batch_results[op.transfer_op_id][2]
-                    # Metrics are diagnostics: they must never decide whether
-                    # a result is reported. Before this guard, a throw here
-                    # (or anywhere below) escaped to the outer handler and
-                    # dropped the results of *every remaining op in the
-                    # batch*, hanging their graphs forever.
-                    metrics = None
-                    try:
-                        is_h2d = (op.transfer_type == TransferType.H2D
-                                  or op.transfer_type == TransferType.LAYERWISE)
-                        metrics = trace.build_worker_metrics(
-                            op,
-                            getattr(op, "prof_submitted_ns", 0),
-                            getattr(op, "_received_ns", launched_ns),
-                            transfer_start_ns,
-                            launched_ns,
-                            self.worker_id,
-                            self._trace_bytes_per_block(),
-                            getattr(self, "kv_dim", 2),
-                            is_h2d,
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        flexkv_logger.error(
-                            f"[worker {self.worker_id}] build_worker_metrics "
-                            f"failed for op {op.transfer_op_id}: {e}",
-                            exc_info=True,
-                        )
-                    # Report the outcome, success or failure: a dropped op
-                    # leaves its graph incomplete forever and leaks every
-                    # resource its plan holds. A bare int still means success,
-                    # so the queue format stays compatible.
-                    try:
-                        if isinstance(transfer_status, WorkerTransferResult):
-                            # Partial-capable backends report completion even
-                            # when zero blocks succeeded, so the graph can
-                            # clean up and the caller can fall back rather
-                            # than hang. Carry metrics so the trace still
-                            # sees the op.
-                            self.finished_ops_queue.put(
-                                (transfer_status, True, metrics))
-                        elif transfer_status:
-                            self.finished_ops_queue.put(
-                                (op.transfer_op_id, True, metrics))
-                        else:
-                            self.finished_ops_queue.put(
-                                (op.transfer_op_id, False, None))
-                    except Exception as e:  # noqa: BLE001
-                        # Queue put failing is unrecoverable for this op, but
-                        # must not take the rest of the batch down with it.
-                        flexkv_logger.error(
-                            f"[worker {self.worker_id}] failed to report result "
-                            f"for op {op.transfer_op_id}: {e}",
-                            exc_info=True,
-                        )
+                            launched_ns = batch_results[op.transfer_op_id][2]
+                        # Metrics are diagnostics: they must never decide whether
+                        # a result is reported. Before this guard, a throw here
+                        # (or anywhere below) escaped to the outer handler and
+                        # dropped the results of *every remaining op in the
+                        # batch*, hanging their graphs forever.
+                        metrics = None
+                        try:
+                            is_h2d = (op.transfer_type == TransferType.H2D
+                                      or op.transfer_type == TransferType.LAYERWISE)
+                            metrics = trace.build_worker_metrics(
+                                op,
+                                getattr(op, "prof_submitted_ns", 0),
+                                getattr(op, "_received_ns", launched_ns),
+                                transfer_start_ns,
+                                launched_ns,
+                                self.worker_id,
+                                self._trace_bytes_per_block(),
+                                getattr(self, "kv_dim", 2),
+                                is_h2d,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            flexkv_logger.error(
+                                f"[worker {self.worker_id}] build_worker_metrics "
+                                f"failed for op {op.transfer_op_id}: {e}",
+                                exc_info=True,
+                            )
+                        # Report the outcome, success or failure: a dropped op
+                        # leaves its graph incomplete forever and leaks every
+                        # resource its plan holds. A bare int still means success,
+                        # so the queue format stays compatible.
+                        try:
+                            if isinstance(transfer_status, WorkerTransferResult):
+                                # Partial-capable backends report completion even
+                                # when zero blocks succeeded, so the graph can
+                                # clean up and the caller can fall back rather
+                                # than hang. Carry metrics so the trace still
+                                # sees the op.
+                                self.finished_ops_queue.put(
+                                    (transfer_status, True, metrics))
+                            elif transfer_status:
+                                self.finished_ops_queue.put(
+                                    (op.transfer_op_id, True, metrics))
+                            else:
+                                self.finished_ops_queue.put(
+                                    (op.transfer_op_id, False, None))
+                        except Exception as e:  # noqa: BLE001
+                            # Queue put failing is unrecoverable for this op, but
+                            # must not take the rest of the batch down with it.
+                            flexkv_logger.error(
+                                f"[worker {self.worker_id}] failed to report result "
+                                f"for op {op.transfer_op_id}: {e}",
+                                exc_info=True,
+                            )
+                finally:
+                    if end_batch is not None:
+                        end_batch()
                 if drain_failed:
                     flexkv_logger.error(
                         f"[worker {self.worker_id}] transfer pipe unusable "

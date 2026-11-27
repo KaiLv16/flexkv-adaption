@@ -2425,7 +2425,7 @@ class GlobalCacheEngine:
                 dst_block_ids=fragment12_cpu_blocks,
                 dp_client_id=dp_client_id,
             )
-            flexkv_logger.info(
+            flexkv_logger.debug(
                 "[FlexKV-SEGV-DEBUG] cache_engine create D2H op (global_put) "
                 f"request_id={request_id}, op_id={op_d2h.op_id}, "
                 f"graph_id={transfer_graph.graph_id}, dp_client_id={dp_client_id}, "
@@ -2741,7 +2741,7 @@ class GlobalCacheEngine:
             dst_block_ids = fragment12_cpu_blocks,
             dp_client_id = dp_client_id,
         )
-        flexkv_logger.info(
+        flexkv_logger.debug(
             "[FlexKV-SEGV-DEBUG] cache_engine create D2H op (local_put) "
             f"request_id={request_id}, op_id={op_d2h.op_id}, "
             f"graph_id={transfer_graph.graph_id}, dp_client_id={dp_client_id}, "

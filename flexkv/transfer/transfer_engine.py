@@ -1161,18 +1161,24 @@ class TransferEngine:
         # First pass always runs: new graphs are dirty even with no completions.
         # Later passes only run when skip-io DISK2H can complete in this tick.
         first = True
-        while first or to_schedule:
-            first = False
-            completed_graph_ids, next_ops = self.scheduler.schedule(to_schedule)
-            to_schedule = []
-            for op in next_ops:
-                done = self._assign_or_complete_op(op)
-                if done is not None:
-                    to_schedule.append(done)
-            self._note_ops_completed(to_schedule)
-            to_schedule.extend(self._take_unparked_skip_io())
-            for graph_id in completed_graph_ids:
-                self.completed_queue.put(CompletedOp.completed_graph(graph_id))
+        pending_batches: Dict[WorkerHandle, List[TransferOp]] = {}
+        self._pending_worker_batches = pending_batches
+        try:
+            while first or to_schedule:
+                first = False
+                completed_graph_ids, next_ops = self.scheduler.schedule(to_schedule)
+                to_schedule = []
+                for op in next_ops:
+                    done = self._assign_or_complete_op(op)
+                    if done is not None:
+                        to_schedule.append(done)
+                self._note_ops_completed(to_schedule)
+                to_schedule.extend(self._take_unparked_skip_io())
+                for graph_id in completed_graph_ids:
+                    self.completed_queue.put(CompletedOp.completed_graph(graph_id))
+        finally:
+            self._pending_worker_batches = None
+            self._flush_worker_batches(pending_batches)
 
     def _op_buffer_registered_here(self, op: TransferOp) -> bool:
         """The 'unified rule' shared by dispatch, _finalize_op and
@@ -1494,7 +1500,7 @@ class TransferEngine:
                     f"graph_id: {replica.graph_id}, worker_key={wk}",
                     color=get_nvtx_range_color(replica.graph_id))
                 op.pending_count += 1
-                worker[wk].submit_transfer(replica)
+                self._submit_worker_op(worker[wk], replica)
                 flexkv_logger.debug(
                     f"[TransferEngine] {label} fan-out: "
                     f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
@@ -1509,7 +1515,29 @@ class TransferEngine:
                 color=get_nvtx_range_color(op.graph_id),
             )
             op.pending_count += 1
-            worker.submit_transfer(op)
+            self._submit_worker_op(worker, op)
+
+    def _submit_worker_op(self, worker: WorkerHandle, op: TransferOp) -> None:
+        pending = getattr(self, "_pending_worker_batches", None)
+        if (
+            pending is not None
+            and getattr(worker, "_remote_sender", None) is None
+            and hasattr(worker, "submit_transfer_batch")
+        ):
+            pending.setdefault(worker, []).append(op)
+            return
+        worker.submit_transfer(op)
+
+    def _flush_worker_batches(
+        self, pending_batches: Dict[WorkerHandle, List[TransferOp]]
+    ) -> None:
+        for worker, ops in pending_batches.items():
+            if not ops:
+                continue
+            if len(ops) == 1:
+                worker.submit_transfer(ops[0])
+            else:
+                worker.submit_transfer_batch(ops)
 
     def submit_transfer_graph(self, transfer_graph: Union[TransferOpGraph, List[TransferOpGraph]]) -> None:
         """Submit a transfer graph for execution"""
