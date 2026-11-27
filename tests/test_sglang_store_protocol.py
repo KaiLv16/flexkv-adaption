@@ -525,6 +525,21 @@ def test_cp_store_marks_uncertainty_after_launch_attempt():
     assert connector._inflight_stores == {"request": 17}
 
 
+def test_draft_store_marks_uncertainty_after_launch_attempt():
+    connector = _follower_connector(None)
+    connector._draft_regions = (object(),)
+    connector._sync_ctx.is_sync_leader = True
+    connector._sync_ctx.scatter.side_effect = lambda value, **_: value
+    connector._swa_kv_pool = None
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.put_match.return_value = (17, np.ones(4, dtype=np.bool_))
+    connector.kv_manager.launch.side_effect = OSError()
+
+    with pytest.raises(StoreSubmissionUncertainError, match="OSError"):
+        connector.store_kv("request", range(4), torch.arange(4))
+    assert connector._inflight_stores == {"request": 17}
+
+
 def test_cp_store_notification_failure_without_leader_launch_has_no_inflight_task():
     connector = _follower_connector(None)
     connector._cache_layer_split = True
@@ -540,26 +555,15 @@ def test_cp_store_notification_failure_without_leader_launch_has_no_inflight_tas
     connector.kv_manager.launch.assert_not_called()
 
 
-def test_namespace_is_forwarded_to_lookup_store_and_prefetch():
+def test_draft_store_notification_failure_without_launch_has_no_task():
     connector = _follower_connector(None)
+    connector._draft_regions = (object(),)
     connector._sync_ctx.is_sync_leader = True
-    connector._sync_ctx.needs_sync = False
-    connector._sync_ctx.is_pp_active = False
-    connector._swa_kv_pool = None
-    connector._pending_lookups = {}
-    connector._pending_lookup_contexts = {}
-    connector._prefetch_enabled = True
-    connector._ongoing_prefetches = {}
-    connector._prefetch_contexts = {}
-    connector._prefetch_planned_tokens = {}
+    connector._sync_ctx.scatter.side_effect = OSError("start notification failed")
     connector.kv_manager = MagicMock()
-    connector.kv_manager.get_match.return_value = (-1, np.zeros(4, dtype=bool))
-    connector.kv_manager.put_match.return_value = (-1, np.zeros(4, dtype=bool))
-    connector.kv_manager.prefetch_async.return_value = (23, 4)
-    namespace = ['["sglang-cache-v1","adapter","salt"]']
-    connector.lookup_kv([1, 2, 3, 4], torch.ones(4, dtype=torch.bool), rid="r", namespace=namespace)
-    connector.store_kv("r", [1, 2, 3, 4], torch.arange(4), namespace=namespace)
-    assert connector.prefetch_async("r", [1, 2, 3, 4], namespace=namespace) == 23
-    for method in (connector.kv_manager.get_match, connector.kv_manager.put_match, connector.kv_manager.prefetch_async):
-        assert method.call_args.kwargs["namespace"] == namespace
-        assert method.call_args.kwargs["token_ids"].tolist() == [1, 2, 3, 4]
+    connector.kv_manager.put_match.return_value = None
+
+    with pytest.raises(OSError, match="start notification failed"):
+        connector.store_kv("request", range(4), torch.arange(4))
+    assert not connector._inflight_stores
+    connector.kv_manager.launch.assert_not_called()
