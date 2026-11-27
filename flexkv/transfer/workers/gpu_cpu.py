@@ -395,14 +395,20 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         if (len(self._cp_holders) != self._num_original_layers or
                 any(not -1 <= r < self.num_gpus for r in self._cp_holders)):
             raise ValueError("Invalid CP layer owners for this transfer worker")
+        self._cp_fixed_owners = {}
         self._cp_owner_mode = RankShareMode.CP_OWNER_ONLY
-        # Only full-KV and its indexer are physically split. SWA regions
-        # keep their own sharing policy even in the same layer milestone.
+        # Full KV and its indexer follow target layer owners. Each draft
+        # replica has a fixed owner. SWA keeps its own sharing policy.
         for ordinal, region in enumerate(main_pool.region_indices):
             layers = (self.layer_groups[ordinal].layer_indices if self.layer_groups
                       else range(self.num_layers))
+            fixed = self.layer_groups[ordinal].transfer_owner_rank if self.layer_groups else None
+            if fixed is not None:
+                if not 0 <= fixed < self.num_gpus:
+                    raise ValueError("Invalid rank-private draft region owner")
+                self._cp_fixed_owners[region] = fixed
             start = 0
-            for owner, run in groupby(self._cp_holders[i] for i in layers):
+            for owner, run in groupby(fixed if fixed is not None else self._cp_holders[i] for i in layers):
                 if owner < 0:
                     raise ValueError("Off-node layer registered for local CP transfer")
                 count = sum(1 for _ in run)
@@ -1298,7 +1304,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 )[0]
                 if pool_id is PoolId.FULL_KV and self._cp_holders is not None:
                     req.rank_share_mode = self._cp_owner_mode
-                    req.designated_rank = self._cp_holders[layer]
+                    req.designated_rank = self._cp_fixed_owners.get(region_index, self._cp_holders[layer])
                 req.milestone_layer = layer
                 requests.append(req)
                 pool_of.append(pool_id)

@@ -70,25 +70,32 @@ def _fields(pool, page):
             yield "index", ids, buffers, 1
 
 
-def build_draft_registration(target, drafts, model, page):
+def build_draft_registration(target, drafts, model, page, split=None):
     """Build one atomic Host block schema. All draft regions complete at target layer zero."""
     _check_pool(target)
-    if model.cp_size > 1 or getattr(target, "layer_shard_enabled", False):
-        raise ValueError("Speculative KV with CP layer split requires the cache layer split integration")
-    if model.pp_size != 1 or model.effective_tp_size_per_node != model.effective_tp_size:
+    if model.pp_size != 1 or (split is None and model.effective_tp_size_per_node != model.effective_tp_size):
         raise ValueError("Speculative cache requires the complete transfer group on one node and PP=1")
     if target.layer_num != model.num_layers or not drafts:
         raise ValueError("Speculative cache needs the full target stage and at least one draft pool")
-    fields = list(_fields(target, page))
+    if split is None and model.cp_size > 1:
+        raise ValueError("Speculative CP cache requires a physically layer-split target")
+    if split is None:
+        fields = list(_fields(target, page))
+    else:
+        _, kv, ids, index = split
+        fields = [("kv_buffer", tuple(range(model.num_layers)), kv, page)]
+        if index is not None:
+            fields.append(("index", ids, index, 1))
     first = fields[0][2][0]
     pages = first.shape[0] // page
     if pages == 0 or first.shape[0] % page:
         raise ValueError("Target KV is not page aligned")
-    # With TP, each rank has a private slice of the packed host block.
+    # With TP, each rank has a private slice of the packed host block. CP
+    # replicas instead get distinct explicitly owned regions in a shared block.
     storage_heads = first.shape[1] * model.tp_size
     result = []
 
-    def region(name, ids, tensors, tokens):
+    def region(name, ids, tensors, tokens, owner=None):
         sample = tensors[0]
         if sample is None or not sample.numel() or sample.ndim not in (2, 3):
             raise ValueError(f"Empty or unsupported buffer in {name}")
@@ -103,7 +110,7 @@ def build_draft_registration(target, drafts, model, page):
                     or tensor.data_ptr() % 8):
                 raise ValueError(f"Inconsistent or unaligned buffers in {name}")
         spec = LayerGroupSpec(len(ids), heads, width, list(ids), dtype=sample.dtype,
-                              compress_ratio=page // tokens)
+                              compress_ratio=page // tokens, transfer_owner_rank=owner)
         layout = KVCacheLayout(type=KVCacheLayoutType.LAYERFIRST, num_layer=len(ids),
                                num_block=pages, tokens_per_block=tokens, num_head=heads,
                                head_size=width, kv_dim=1, num_kv_heads=storage_heads)
@@ -112,6 +119,9 @@ def build_draft_registration(target, drafts, model, page):
     for name, ids, tensors, tokens in fields:
         region("target." + name, ids, tensors, tokens)
     spans = [(t.data_ptr(), t.data_ptr() + t.nbytes) for r in result for t in r.buffers]
+    if split is not None:
+        # resolve_layer_split already validated intentional shared broadcast scratch.
+        spans = list(set(spans))
     draft_spans = []
     for runner, pool in enumerate(drafts):
         if getattr(pool, "layer_shard_enabled", False) or getattr(pool, "page_size", page) != page:
@@ -120,7 +130,11 @@ def build_draft_registration(target, drafts, model, page):
             raise ValueError("Empty draft KV pool")
         for name, ids, tensors, tokens in _fields(pool, page):
             for layer, tensor in zip(ids, tensors):
-                region(f"draft.{runner}.{name}.{layer}", [0], [tensor], tokens)
+                # A CP rank's draft bytes can differ from every other rank's.
+                # Fence *all* replicas on the first target milestone.
+                owners = range(model.cp_size) if split is not None else (None,)
+                for owner in owners:
+                    region(f"draft.{runner}.{name}.{layer}", [0], [tensor], tokens, owner)
                 draft_spans.append((tensor.data_ptr(), tensor.data_ptr() + tensor.nbytes))
     ordered = sorted((*spans, *draft_spans))
     if any(end > start for (_, end), (start, _) in zip(ordered, ordered[1:])):

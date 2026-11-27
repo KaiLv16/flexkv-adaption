@@ -380,16 +380,19 @@ class FlexKVConnector:
         self._validate_kv_pool_support(kvcache, pool, server_args)
         layer_split_requested = (getattr(server_args, "enable_dsa_cache_layer_split", False)
                            or getattr(server_args, "enable_nsa_cache_layer_split", False))
+        split = None
         configured_groups = self.model_config.layer_groups
         if getattr(pool, "layer_shard_enabled", False) or (layer_split_requested and self.model_config.cp_size > 1):
             kv_caches, indexer_group = self._resolve_cache_layer_split(
-                pool, layer_split_plan,
+                pool, layer_split_plan, validate_groups=not draft_enabled,
                 model_identity=(getattr(server_args, "model_path", None), getattr(server_args, "revision", None)))
-        elif draft_enabled:
-            kv_caches, indexer_group = self._resolve_draft_registration(
-                pool, draft_kvcache, server_args, configured_groups, draft_key_format
+            split = (
+                self.model_config.h2d_layer_holders,
+                kv_caches,
+                indexer_group.layer_indices if indexer_group is not None else (),
+                indexer_group.buffers if indexer_group is not None else None,
             )
-        else:
+        elif not draft_enabled:
             kv_caches, indexer_group = self._resolve_kv_buffers(kvcache)
             if (
                 not self._is_dsv4
@@ -438,6 +441,10 @@ class FlexKVConnector:
                         json.dumps(format_layout, default=str).encode()
                     ).hexdigest()
                     self._cache_layout_key = f"flexkv.format.v1.{digest}"
+        if draft_enabled:
+            kv_caches, indexer_group = self._resolve_draft_registration(
+                pool, draft_kvcache, server_args, split, configured_groups, draft_key_format
+            )
         if self._swa_kv_pool is not None and self.cache_config.swa is not None:
             buffers = self._swa_kv_pool.kv_buffer
             snapshot_bytes = sum(
@@ -2496,7 +2503,7 @@ class FlexKVConnector:
             logical_layer_count=len(buffers),
         )
 
-    def _resolve_cache_layer_split(self, pool, plan, model_identity=None):
+    def _resolve_cache_layer_split(self, pool, plan, validate_groups=True, model_identity=None):
         model = self.model_config
         group = self._sync_ctx.attn_cp_cpu_group
         if group is None or group.size() != model.cp_size:
@@ -2554,7 +2561,7 @@ class FlexKVConnector:
                         dtype=kv[0].dtype,
                     )
                 ]
-            if model.layer_groups is not None and model.layer_groups != specs:
+            if validate_groups and model.layer_groups is not None and model.layer_groups != specs:
                 raise ValueError("Configured layer groups differ from the physical KV and indexer")
             storage_format_tag = getattr(pool, "storage_format_tag", None)
             index_sig = (tuple(index[0].shape), str(index[0].dtype)) if index is not None else None
@@ -2601,14 +2608,13 @@ class FlexKVConnector:
             self._cache_layout_key = f"flexkv.dsa.sparse.v1.{digest}"
         return kv, indexer
 
-    def _resolve_draft_registration(self, pool, drafts, args, configured_groups, key_format="token"):
+    def _resolve_draft_registration(self, pool, drafts, args, split, configured_groups, key_format="token"):
         from flexkv.integration.sglang.draft_cache import build_draft_registration
 
         model = self.model_config
-        group = self._sync_ctx.attn_tp_cpu_group
+        group = (self._sync_ctx.attn_cp_cpu_group if model.cp_size > 1
+                 else self._sync_ctx.attn_tp_cpu_group)
         try:
-            if model.cp_size > 1 or getattr(pool, "layer_shard_enabled", False):
-                raise ValueError("Speculative KV with CP layer split requires the cache layer split integration")
             if (self._is_dsv4 or self._swa_kv_pool is not None or self._kvcache is not pool
                     or GLOBAL_CONFIG_FROM_ENV.cpu_layout_type != KVCacheLayoutType.BLOCKFIRST
                     or GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode == "all_write"
@@ -2617,9 +2623,9 @@ class FlexKVConnector:
                 raise ValueError("Speculative KV requires a full-attention pool and BLOCKFIRST host transfers")
             if model.effective_tp_size > 1 and (group is None or group.size() != model.effective_tp_size
                                                 or not self._sync_ctx.needs_sync):
-                raise ValueError("Speculative KV requires one synchronized attention TP group")
+                raise ValueError("Speculative KV requires one synchronized attention TP or CP group")
             pools = drafts if isinstance(drafts, (tuple, list)) else (() if drafts is None else (drafts,))
-            regions = build_draft_registration(pool, pools, model, self.page_size)
+            regions = build_draft_registration(pool, pools, model, self.page_size, split)
             specs = [r.spec for r in regions]
             if configured_groups is not None and configured_groups != specs:
                 raise ValueError("Configured cache groups differ from target and draft storage")
@@ -2629,11 +2635,11 @@ class FlexKVConnector:
                 "speculative_draft_window_size", "speculative_draft_sink_size", "tp_size",
                 "kv_cache_dtype", "quantization", "speculative_draft_model_quantization")]
             schema = [(r.name, r.spec.layer_indices, r.spec.num_kv_heads, r.spec.head_size,
-                       str(r.spec.dtype), r.spec.compress_ratio, None) for r in regions]
+                       str(r.spec.dtype), r.spec.compress_ratio, r.spec.transfer_owner_rank) for r in regions]
             pool_formats = [(type(p).__qualname__, str(getattr(p, "dtype", None)),
                              str(getattr(p, "store_dtype", None)),
                              getattr(p, "storage_format_tag", None)) for p in (pool, *pools)]
-            identity += [pool_formats, key_format, self.page_size, model.tp_size, model.cp_size, getattr(model, "h2d_layer_holders", None), schema]
+            identity += [pool_formats, key_format, self.page_size, model.tp_size, model.cp_size, model.h2d_layer_holders, schema]
             if model.nnodes > 1:
                 identity.append(model.nnodes)
             key = hashlib.sha256(json.dumps(identity, default=str).encode()).hexdigest()

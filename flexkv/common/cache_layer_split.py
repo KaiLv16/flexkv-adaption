@@ -8,13 +8,20 @@ def node_groups(model, node):
     first = node * width
     groups, selections = [], []
     for ordinal, group in enumerate(model.layer_groups):
-        indices = [
-            i for i, layer in enumerate(group.layer_indices)
-            if first <= model.h2d_layer_holders[layer] < first + width
-        ]
+        fixed = group.transfer_owner_rank
+        if fixed is None:
+            indices = [
+                i for i, layer in enumerate(group.layer_indices)
+                if first <= model.h2d_layer_holders[layer] < first + width
+            ]
+        elif first <= fixed < first + width:
+            indices = list(range(group.num_layers))
+        else:
+            continue
         if indices:
             groups.append(replace(group, num_layers=len(indices),
-                                  layer_indices=[group.layer_indices[i] for i in indices]))
+                                  layer_indices=[group.layer_indices[i] for i in indices],
+                                  transfer_owner_rank=None if fixed is None else fixed - first))
             selections.append((ordinal, indices))
     if not groups:
         raise ValueError(f"Physical CP node {node} has no cache data")

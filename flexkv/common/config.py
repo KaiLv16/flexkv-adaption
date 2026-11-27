@@ -63,6 +63,8 @@ class LayerGroupSpec:
     # (e.g. CSA at 4x, HCA at 128x). ``tokens_per_block % compress_ratio == 0``
     # is enforced when the KVCacheLayout is built.
     compress_ratio: int = 1
+    # A rank-private replica attached to a different target layer milestone.
+    transfer_owner_rank: Optional[int] = None
 
 
 @dataclass(frozen=True)
