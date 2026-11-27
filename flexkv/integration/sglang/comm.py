@@ -389,6 +389,20 @@ class FlexKVComm:
             self._bcast_to_stage_members(tensor, self._TAG_AR_BCAST)
         return int(tensor.item())
 
+    def cp_agrees(self, signature: Optional[bytes]) -> bool:
+        """Compare a 16-byte signature in one CP CPU collective."""
+        if signature is None:
+            # A rejected input forces both reductions to the floor, so the
+            # decoded minimum and maximum cannot agree.
+            extrema = torch.full((4,), torch.iinfo(torch.int64).min, dtype=torch.int64)
+        else:
+            first = int.from_bytes(signature[:8], "little", signed=True)
+            second = int.from_bytes(signature[8:], "little", signed=True)
+            # The minimum of the complemented words encodes the maximum.
+            extrema = torch.tensor([first, second, ~first, ~second], dtype=torch.int64)
+        dist.all_reduce(extrema, op=dist.ReduceOp.MIN, group=self.attn_cp_cpu_group)
+        return torch.equal(extrema[:2], ~extrema[2:])
+
     def barrier(self) -> None:
         if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None:
             dist.barrier(group=self.attn_tp_cpu_group)

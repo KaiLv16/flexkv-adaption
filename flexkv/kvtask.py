@@ -222,16 +222,17 @@ class KVTaskManager:
             # index: release builds cythonize this module with
             # wraparound=False, so ``transfer_handles[-1]`` on a list reads off
             # the front of it instead of folding to len - 1.
-            remote_handle = TransferManagerHandle(
-                model_config,
-                cache_config,
-                mode="remote",
-                gpu_register_port=gpu_register_port,
-                master_host=self.model_config.master_host,
-                master_ports=self.model_config.master_ports,
-            )
-            self.transfer_handles.append(remote_handle)
-            remote_handle._handle.send_config_to_remotes()
+            for node in range(1, max(2, self.model_config.layer_split_nodes)):
+                remote_handle = TransferManagerHandle(
+                    model_config,
+                    cache_config,
+                    mode="remote",
+                    gpu_register_port=gpu_register_port,
+                    master_host=self.model_config.master_host,
+                    master_ports=self.model_config.remote_ports_for_node(node),
+                )
+                self.transfer_handles.append(remote_handle)
+                remote_handle._handle.send_config_to_remotes()
 
         # Active transfers own blocks and callbacks until graph completion.
         # A TTL must never evict that ownership while DMA is still in flight.

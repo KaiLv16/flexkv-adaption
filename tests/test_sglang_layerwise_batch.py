@@ -20,6 +20,7 @@ pytestmark = pytest.mark.unit
 def connector():
     c = FlexKVConnector.__new__(FlexKVConnector)
     c.enable_layerwise = True
+    c.page_size = 1
     c.layer_done_counter = FlexKVLayerDoneCounter(3)
     c.layer_done_counter.wait_timeout_s = 0.1
     c._sync_ctx = SimpleNamespace(
@@ -175,7 +176,7 @@ def test_launch_transport_failure_cannot_free_potential_dma_targets(connector):
     c.kv_manager.cancel.assert_not_called()
 
 
-@pytest.mark.parametrize("mismatch", [False, True])
+@pytest.mark.parametrize("mismatch", [None, "batch", "slots"])
 def test_four_rank_protocol_agrees_before_single_leader_launch(mismatch):
     # Synchronous collectives are simulated; eventfd state is real on each rank.
     fixtures = [connector.__wrapped__() for _ in range(4)]
@@ -204,8 +205,17 @@ def test_four_rank_protocol_agrees_before_single_leader_launch(mismatch):
         )
     for i, c in enumerate(ranks):
         c._sync_ctx = context(i)
+        c._cache_layer_split = True
     def run(rank):
         c = ranks[rank]
+        if mismatch == "slots":
+            c._pending_lookups["a"] = 1
+            start = 100 if rank == 2 else 0
+            assert c.start_load_kv_layerwise(
+                "a", torch.arange(start, start + 4), defer_launch=True
+            ) == (0, -1)
+            assert not c._prepared_layerwise_loads
+            return
         for rid, tid in [("a", 1), ("b", 2), ("c", 3)]:
             _, producer = prepare(c, rid, tid)
         rids = ["a", "b"] if mismatch and rank == 2 else ["a", "b", "c"]
@@ -219,8 +229,104 @@ def test_four_rank_protocol_agrees_before_single_leader_launch(mismatch):
         with ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(run, range(4)))
         assert ranks[0].kv_manager.launch.call_count == (0 if mismatch else 1)
+        if mismatch == "slots":
+            ranks[0].kv_manager.cancel.assert_called_once_with([1])
         for c in ranks[1:]:
             c.kv_manager.launch.assert_not_called()
     finally:
         for f in fixtures:
             next(f, None)
+
+
+def test_cp_sync_restore_with_layerwise_worker(connector):
+    c = connector
+    c.model_config = SimpleNamespace(num_layers=3)
+    c._sync_ctx.all_reduce_min = MagicMock(side_effect=lambda value: value)
+    c._cache_layer_split = True
+    c._invalidate_layer_split_cache = MagicMock()
+    c._pending_lookups["r"] = 71
+
+    def launch(**kwargs):
+        assert kwargs["layerwise_transfer"] and kwargs["task_ids"] == [71]
+        event = c.layer_done_counter.events[kwargs["counter_id"]]
+        for fd in event.load_event_fds:
+            os.eventfd_write(fd, 1)
+        return [900]
+
+    c.kv_manager.launch.side_effect = launch
+    assert c.retrieve_kv("r", torch.arange(4)) == 4
+    c._invalidate_layer_split_cache.assert_called_once()
+    assert c.layer_done_counter.consumer_index == -1
+    assert c._launched_load_tids == [900]
+
+
+def test_cp_immediate_launch_failure_retains_counter(connector):
+    c = connector
+    c._cache_layer_split = True
+    c._invalidate_layer_split_cache = MagicMock()
+    c._sync_ctx.all_reduce_min = MagicMock(side_effect=lambda value: value)
+    c.kv_manager.launch.side_effect = OSError("reply lost")
+    with pytest.raises(OSError, match="reply lost"):
+        prepare(c, "a", 1, defer=False)
+    c._sync_ctx.all_reduce_min.assert_called_with(0)
+    assert c.layer_done_counter.consumer_index >= 0
+    with pytest.raises(RuntimeError):
+        c.reset()
+
+
+def test_cp_whole_restore_retains_task_until_terminal(connector):
+    c = connector
+    c.enable_layerwise = False
+    c._cache_layer_split = True
+    c._invalidate_layer_split_cache = MagicMock()
+    c._sync_ctx.all_reduce_min = MagicMock(side_effect=lambda value: value)
+    c._sync_ctx.cp_agrees = MagicMock(return_value=True)
+    c._pending_lookups["r"] = 71
+    c.kv_manager.wait.return_value = {}
+    with pytest.raises(RuntimeError, match="uncertain"):
+        c.retrieve_kv("r", torch.arange(4))
+    assert c.kv_manager.launch.call_args.kwargs["task_ids"] == [71]
+    assert not c.kv_manager.launch.call_args.kwargs["as_batch"]
+    c.kv_manager.wait.assert_called_with([71], timeout=30.0, completely=True)
+    assert c._launched_load_tids == [71]
+    c._sync_ctx.all_reduce_min.assert_called_with(-1)
+
+def test_cp_whole_restore_rejects_slots_before_launch(connector):
+    connector.enable_layerwise = False
+    connector._cache_layer_split = True
+    connector._sync_ctx.cp_agrees = MagicMock(return_value=False)
+    connector._sync_ctx.all_reduce_min = MagicMock(side_effect=lambda value: value)
+    connector._pending_lookups["r"] = 71
+    with pytest.raises(RuntimeError, match="disagree on H2D slots"):
+        connector.retrieve_kv("r", torch.arange(4))
+    connector.kv_manager.cancel.assert_called_once_with([71])
+    connector.kv_manager.launch.assert_not_called()
+
+
+def test_cp_sync_restore_leaves_existing_prepared_batch_intact(connector):
+    c = connector
+    c._cache_layer_split = True
+    c._invalidate_layer_split_cache = MagicMock()
+    c._sync_ctx.all_reduce_min = MagicMock(side_effect=lambda value: value)
+    prepare(c, "first", 1)
+    c._invalidate_layer_split_cache.assert_not_called()
+    c._pending_lookups["second"] = 2
+    with pytest.raises(RuntimeError, match="active layerwise batch"):
+        c.retrieve_kv("second", torch.arange(4))
+    assert list(c._prepared_layerwise_loads) == ["first"]
+    assert c._pending_lookups["second"] == 2
+    c.kv_manager.launch.assert_not_called()
+
+
+
+def test_restore_hook_alone_does_not_enable_cache_layer_split(connector):
+    connector.enable_layerwise = False
+    connector._invalidate_layer_split_cache = MagicMock()
+    connector._pending_lookups["r"] = 71
+    connector.kv_manager.wait.return_value = {71: SimpleNamespace(status="success")}
+
+    assert connector.retrieve_kv("r", torch.arange(4)) == 4
+    connector._invalidate_layer_split_cache.assert_called_once()
+    assert connector.kv_manager.launch.call_args.kwargs["as_batch"]
+    assert not connector.kv_manager.wait.call_args.kwargs["completely"]
+    assert connector._launched_load_tids == []

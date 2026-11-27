@@ -865,6 +865,7 @@ class MooncakeStoreCacheEngine:
             getattr(cache_config, "mooncake_store_total_layers", 0) or 0
         )
         swa_cfg = getattr(cache_config, "swa", None)
+        self.cp_nodes = getattr(cache_config, "layer_split_nodes", 1)
         self._swa_enabled = swa_cfg is not None and getattr(swa_cfg, "enabled", False)
 
         mooncake_store_config = MooncakeStoreConfig.from_file(cache_config)
@@ -932,6 +933,19 @@ class MooncakeStoreCacheEngine:
         n_blocks = len(block_hashes)
         if n_blocks == 0:
             return 0, 0, 0
+        nodes = getattr(self, "cp_nodes", 1)
+        if nodes > 1:
+            keys = [build_key(h, PoolKind.KV, cp_nodes=nodes, cp_node=node)
+                    for h in block_hashes for node in range(nodes)]
+            states = self.mooncake_store_client.batch_exists_impl(keys)
+            if len(states) != len(keys):
+                return 0, 0, 0
+            matched = 0
+            for i in range(0, len(states), nodes):
+                if any(state != 1 for state in states[i:i + nodes]):
+                    break
+                matched += 1
+            return matched, matched, 0
         kv_keys = [self._build_pool_key(h, PoolKind.KV) for h in block_hashes]
         if not self._swa_enabled:
             kv_matched = self.mooncake_store_client.batch_exists(kv_keys)

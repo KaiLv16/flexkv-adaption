@@ -175,8 +175,8 @@ def make_requests(
     regions -- an SWA-only D2H names just the SWA regions, and the block ids
     given are then that pool's slot ids.  Default is every region, in order.
 
-    ``share_mode`` applies only to rank-shared regions (``num_kv_heads == 1``)
-    on the way out; C++ ignores it everywhere else.
+    Replication policies select D2H writers for single-head regions.
+    CP_OWNER_ONLY selects the physical owner for both directions.
     """
     if not region_batch_available():
         raise RuntimeError(

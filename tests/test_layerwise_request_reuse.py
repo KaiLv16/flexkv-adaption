@@ -84,6 +84,7 @@ def _worker(fx: MultiGroupFixture, *, with_swa_pool: bool) -> GPUCPUTransferWork
     w._completion = CompletionContract.PER_LAYER
     w._layerwise_completion_timeout_s = 120.0
     w._request_cache = {}
+    w._cp_holders = None
 
     num_groups = len(fx.layer_groups)
     w._pools = {

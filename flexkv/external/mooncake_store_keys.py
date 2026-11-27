@@ -31,9 +31,13 @@ def build_key(
     node_layer_start: int = 0,
     node_layer_end: int = 0,
     total_layers: int = 0,
+    cp_nodes: int = 1,
+    cp_node: int = 0,
 ) -> str:
     """Build a Mooncake-store key from a block hash and a pool kind."""
     base = f"{block_hash}_{kind.value}"
+    if cp_nodes > 1:
+        return f"{base}_cpnode_{cp_node}_of_{cp_nodes}"
     if total_layers > 0 and (node_layer_end - node_layer_start) == total_layers:
         return base
     if pp_size > 1:

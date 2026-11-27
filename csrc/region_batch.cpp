@@ -214,9 +214,8 @@ RegionTransferArgs RegionBatchGroup::build_args(const RegionRequest &req,
     // there is nothing shared to divide.
     a.cpu_startoff_inside_chunks = rank * d.cpu_tp_stride_in_bytes;
   } else if (!req.is_host_to_device && n_ranks > 1) {
-    // Rank-shared KV on the way out: every rank holds the same bytes, so the
-    // group gets to choose who writes what.  H2D is unaffected -- each rank
-    // needs the whole thing no matter who produced it.
+    // For replicated KV the D2H policy selects each writer and its slice.
+    // A physical CP owner transfers a full chunk in either direction.
     switch (req.rank_share_mode) {
     case RankShareMode::SHARDED: {
       // Each rank writes its 1/N slice of the chunk, gpu and cpu offsets
@@ -238,6 +237,7 @@ RegionTransferArgs RegionBatchGroup::build_args(const RegionRequest &req,
       a.num_layers = count;
       break;
     }
+    case RankShareMode::CP_OWNER_ONLY:
     case RankShareMode::RANK0_ONLY:
     case RankShareMode::RANK_ROTATE:
       // Non-designated ranks never reach here (rank_participates filtered
@@ -254,6 +254,9 @@ bool RegionBatchGroup::rank_participates(const RegionRequest &req,
                                          int rank) const {
   const RegionDesc &d = regions_[req.region_index].desc;
   const int n_ranks = pool_->size();
+  if (req.rank_share_mode == RankShareMode::CP_OWNER_ONLY) {
+    return rank == req.designated_rank;
+  }
   if (d.num_kv_heads > 1 || req.is_host_to_device || n_ranks <= 1) {
     return true;
   }
@@ -283,6 +286,12 @@ RegionBatchGroup::prepare(const std::vector<RegionRequest> &requests_in,
                               std::to_string(num_regions()) + ")");
     }
     const RegionDesc &d = regions_[req.region_index].desc;
+    if (req.rank_share_mode == RankShareMode::CP_OWNER_ONLY &&
+        (d.num_kv_heads != 1 || req.designated_rank < 0 ||
+         req.designated_rank >= n_ranks)) {
+      throw std::invalid_argument("region '" + d.name +
+                                  "': invalid physical CP owner or head layout");
+    }
     if (req.gpu_block_id_tensor.numel() != req.cpu_block_id_tensor.numel()) {
       throw std::invalid_argument(
           "region '" + d.name + "': gpu/cpu block id counts differ (" +

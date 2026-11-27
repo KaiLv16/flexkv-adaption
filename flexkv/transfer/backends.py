@@ -926,6 +926,8 @@ class MooncakeStoreBackend(StorageBackend):
         # PP isolation + layer-range key suffix; see ``build_key``.
         self.pp_rank = int(getattr(cache_config, 'mooncake_store_pp_rank', 0) or 0)
         self.pp_size = int(getattr(cache_config, 'mooncake_store_pp_size', 1) or 1)
+        self.cp_nodes = getattr(cache_config, "layer_split_nodes", 1)
+        self.cp_node = getattr(cache_config, "layer_split_node", 0)
         self.node_layer_start = int(
             getattr(cache_config, 'mooncake_store_node_layer_start', 0) or 0)
         self.node_layer_end = int(
@@ -1092,6 +1094,8 @@ class MooncakeStoreBackend(StorageBackend):
                 node_layer_start=self.node_layer_start,
                 node_layer_end=self.node_layer_end,
                 total_layers=self.total_layers,
+                cp_nodes=getattr(self, "cp_nodes", 1),
+                cp_node=getattr(self, "cp_node", 0),
             )
             for h in raw[:len(ptrs)]
         ]

@@ -429,6 +429,12 @@ class TransferManager:
         # KVManager; this path covers late discovery at GPU registration.
         recompute_cache_block_counts(self.model_config, self.cache_config)
 
+        model = self.model_config
+        selections = None
+        if model.layer_split_nodes > 1:
+            from flexkv.common.cache_layer_split import localize, slice_registration
+            model, selections = localize(model, sorted(key[1] for key in self.all_gpu_blocks))
+            self.cache_config.layer_split_node = model.layer_split_node
         radix_client = None
         if GLOBAL_CONFIG_FROM_ENV.enable_radixshmem:
             from flexkv.server.shm_radix_bootstrap import (adopt_geometry, attach_radix_client,
@@ -440,7 +446,7 @@ class TransferManager:
             adopt_geometry(self.cache_config, radix_client, label="TransferManager")
             self._radix_client = radix_client
         self.storage_engine = StorageEngine(
-            self.model_config,
+            model,
             self.cache_config,
             num_layers_per_pp_stage,
             swa_layer_groups=self.swa_layer_groups,
@@ -493,10 +499,12 @@ class TransferManager:
                 if worker_key not in grouped_gpu_blocks_per_group:
                     grouped_gpu_blocks_per_group[worker_key] = []
                     grouped_gpu_layouts_per_group[worker_key] = []
-                grouped_gpu_blocks_per_group[worker_key].append(
-                    self.all_gpu_blocks_per_group[registration_key])
-                grouped_gpu_layouts_per_group[worker_key].append(
-                    self.all_gpu_layouts_per_group[registration_key])
+                blocks = self.all_gpu_blocks_per_group[registration_key]
+                layouts = self.all_gpu_layouts_per_group[registration_key]
+                if selections is not None:
+                    blocks, layouts = slice_registration(blocks, layouts, selections)
+                grouped_gpu_blocks_per_group[worker_key].append(blocks)
+                grouped_gpu_layouts_per_group[worker_key].append(layouts)
 
         cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
             if self.cache_config.enable_cpu else None
@@ -552,7 +560,7 @@ class TransferManager:
 
         self.transfer_engine = TransferEngine(
             gpu_handles=grouped_gpu_handles,
-            model_config=self.model_config,
+            model_config=model,
             cache_config=self.cache_config,
             cpu_handle=cpu_handle,
             ssd_handle=ssd_handle,
@@ -744,7 +752,8 @@ class TransferManagerOnRemote(TransferManager):
                                 if completed_op.graph_id in self._active_graphs:
                                     task_end_op_id = self._active_graphs[completed_op.graph_id]
 
-                                    if (completed_op.block_results is not None
+                                    if completed_op.op_id != -1 and (self.model_config.layer_split_nodes > 1
+                                            or completed_op.block_results is not None
                                             or (task_end_op_id != -1
                                                 and completed_op.op_id == task_end_op_id)):
                                         # Preserve backend-specific completion details
@@ -806,6 +815,12 @@ class TransferManagerOnRemote(TransferManager):
         Otherwise, store graph in pending_graphs for later matching.
         """
         task_id = graph.graph_id  # Use graph_id as task_id for matching
+        if self.model_config.layer_split_nodes > 1:
+            # CP ranks use identical slot IDs. The graph already carries them.
+            with self._active_graphs_lock:
+                self._active_graphs[graph.graph_id] = task_end_op_id
+            self.submit(graph)
+            return
         with self._pending_lock:
             if task_id in self._pending_slot_mappings:
                 # slot_mapping already arrived, set GPU blocks and submit

@@ -75,14 +75,15 @@ struct RegionDesc {
 // every rank holds identical bytes (num_kv_heads == 1, e.g. MLA).  Head-sharded
 // regions ignore this entirely: there the split is the head split.
 //
-// Only D2H is affected.  On H2D every rank needs the whole thing regardless of
-// who wrote it, so every mode reads the same bytes.
+// Replication policies affect D2H. A physically sharded layer has a single
+// valid GPU pointer, so CP_OWNER_ONLY applies in both directions.
 enum class RankShareMode {
   SHARDED = 0,       // each rank writes its 1/N slice of the chunk
   ALL_WRITE,         // every rank writes a full copy into its own CPU region
   RANK0_ONLY,        // only the designated rank writes
   LAYER_PARALLEL,    // ranks split the layer range
   RANK_ROTATE,       // rank0_only with a round-robin designated rank
+  CP_OWNER_ONLY,     // only the physical layer owner reads or writes
 };
 
 // Parse the Python-side string.  Unknown values degrade to SHARDED with a
@@ -200,9 +201,8 @@ private:
   // The rank-local slice of one request, i.e. exactly what a backend needs.
   RegionTransferArgs build_args(const RegionRequest &req, int rank) const;
 
-  // Whether ``rank`` participates in this request at all.  Only rank-shared
-  // D2H can answer false (rank0_only's non-designated ranks, layer_parallel's
-  // ranks that drew zero layers).
+  // For physical CP, only the owner participates in either direction.
+  // Replicated regions may also skip ranks according to their D2H policy.
   bool rank_participates(const RegionRequest &req, int rank) const;
 
   // Shared prologue of submit() and submit_layerwise(): validate every

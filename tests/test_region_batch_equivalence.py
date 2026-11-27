@@ -284,3 +284,60 @@ def test_roundtrip_through_the_batch_restores_every_regions_gpu_data(
     del group
 
 
+@pytest.mark.parametrize("notify_mode", [None, "polling", "hostfunc"])
+@pytest.mark.parametrize("use_ce", [False, True], ids=["sm", "ce"])
+def test_cache_layer_split_owner_roundtrip(notify_mode, use_ce):
+    """Nonowners share one scratch pointer. Even a single stray DMA corrupts it."""
+    from eventfd_probe import Fds
+    from flexkv.c_ext import RankShareMode
+
+    owners = (0, 0, 1)
+    layers = len(owners)
+    blocks, width = 4, 128
+    host = torch.zeros((blocks, layers, width), dtype=torch.uint8, pin_memory=True)
+    scratch = [torch.full((blocks, width), 0xFE, dtype=torch.uint8, device=f"cuda:{r}")
+               for r in range(2)]
+    gpu = [[torch.full_like(scratch[r], i + 1) if owner == r else scratch[r]
+            for i, owner in enumerate(owners)] for r in range(2)]
+    spec = RegionSpec(
+        name="split", cpu_ptr=host.data_ptr(), cpu_kv_stride=width,
+        cpu_layer_stride=width, cpu_block_stride=layers * width, cpu_tp_stride=0,
+        gpu_block_ptrs_flat=[buf.data_ptr() for rank in gpu for buf in rank],
+        num_tensors_per_gpu=layers, gpu_kv_strides=[0, 0],
+        gpu_block_strides=[width] * 2, gpu_layer_strides=[width * blocks] * 2,
+        gpu_chunk_sizes=[width] * 2, num_layers=layers,
+    )
+    group = build_region_batch([spec], [0, 1], is_blockfirst=True)
+    ids = block_ids(blocks)
+
+    def requests(h2d):
+        result = []
+        for layer, owner in enumerate(owners):
+            req, = make_requests(1, ids, ids, h2d, layer_id=layer, layer_granularity=1,
+                                 use_ce_transfer=use_ce, share_mode=RankShareMode.CP_OWNER_ONLY,
+                                 designated_rank=owner)
+            req.milestone_layer = layer
+            result.append(req)
+        return result
+
+    sync_all(2)
+    group.submit(requests(False), True)
+    for layer, owner in enumerate(owners):
+        assert torch.all(host[:, layer] == layer + 1)
+        gpu[owner][layer].zero_()
+    sync_all(2)
+    if notify_mode is None:
+        group.submit(requests(True), True)
+    else:
+        with Fds(1, 2, layers) as fds:
+            group.set_layer_eventfds(fds.tensor(), 2, layers, notify_mode)
+            group.submit_layerwise(requests(True), [], 0)
+            ok, error = group.wait_layer_completion(30)
+            assert ok, error
+            group.wait_all_streams()
+            for layer in range(layers):
+                assert fds.units(layer) == [1, 1]
+    for layer, owner in enumerate(owners):
+        assert torch.all(gpu[owner][layer] == layer + 1)
+    for buf in scratch:
+        assert torch.all(buf == 0xFE)

@@ -773,6 +773,10 @@ class FlexKVConfig:
             pp_end_layer = self.model_config.num_layers
         self.model_config.enable_dp_attention = bool(enable_dp_attention)
         self.model_config.nnodes = max(1, int(nnodes))
+        if (attn_cp_size > 1 and int(nnodes) > 1 and
+                (getattr(server_args, "enable_dsa_cache_layer_split", False)
+                 or getattr(server_args, "enable_nsa_cache_layer_split", False))):
+            self.model_config.layer_split_nodes = int(nnodes)
         self.model_config.local_dp_size = local_dp_size
         _dist_init_addr = getattr(server_args, 'dist_init_addr', None)
         if _dist_init_addr and int(nnodes) > 1:

@@ -8,6 +8,7 @@ delivery is a completion contract on this worker, not a separate class.
 
 import time
 from dataclasses import dataclass, field
+from itertools import groupby
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
@@ -214,7 +215,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                  # fan-out, plus a per-layer eventfd post. WHOLE (the default)
                  # never opens the UDS and never records a marker.
                  completion: Union[str, CompletionContract, None] = None,
-                 layerwise_eventfd_socket: Optional[str] = None):
+                 layerwise_eventfd_socket: Optional[str] = None,
+                 h2d_layer_holders: Optional[Tuple[int, ...]] = None):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
@@ -369,9 +371,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 swa_pool.keepalive.append(imported_swa)
             self._pools[PoolId.SWA] = swa_pool
 
+        self._cp_holders = h2d_layer_holders
         self._build_region_batch(cpu_kv_layout)
 
         self._compressor = compressor or NullCompressionStrategy()
+        self._init_cp_routes(main_pool)
         # Before attach(): a compressor that transfers through the thread group
         # reads ``worker.tp_transfer_thread_group`` in attach() itself.
         self._materialize_thread_groups()
@@ -379,6 +383,31 @@ class GPUCPUTransferWorker(TransferWorkerBase):
         self._init_completion(completion, layerwise_eventfd_socket,
                               tp_group_size)
         self._compressor.attach(self)
+
+    def _init_cp_routes(self, main_pool: "_Pool") -> None:
+        self._cp_ranges = []
+        if self._cp_holders is None:
+            return
+        from flexkv.c_ext import RankShareMode
+
+        if self.region_batch is None or self._compressor.needs_gpu_cpu_thread_group:
+            raise RuntimeError("Physical CP layer split requires uncompressed region batch transfers")
+        if (len(self._cp_holders) != self._num_original_layers or
+                any(not -1 <= r < self.num_gpus for r in self._cp_holders)):
+            raise ValueError("Invalid CP layer owners for this transfer worker")
+        self._cp_owner_mode = RankShareMode.CP_OWNER_ONLY
+        # Only full-KV and its indexer are physically split. SWA regions
+        # keep their own sharing policy even in the same layer milestone.
+        for ordinal, region in enumerate(main_pool.region_indices):
+            layers = (self.layer_groups[ordinal].layer_indices if self.layer_groups
+                      else range(self.num_layers))
+            start = 0
+            for owner, run in groupby(self._cp_holders[i] for i in layers):
+                if owner < 0:
+                    raise ValueError("Off-node layer registered for local CP transfer")
+                count = sum(1 for _ in run)
+                self._cp_ranges.append((region, start, count, owner))
+                start += count
 
     def _ordered_pools(self) -> List["_Pool"]:
         """This worker's pools in PoolId order.
@@ -571,7 +600,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                 ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
                 ce_gather_nt=GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
             )
-        except Exception as e:  # noqa: BLE001 - fall back, do not fail init
+        except Exception as e:
+            if self._cp_holders is not None:
+                raise RuntimeError("Cannot initialize physical CP region batch") from e
             flexkv_logger.warning(
                 f"region batch unavailable, using per-group transfers: {e}")
             self.region_batch = None
@@ -1142,19 +1173,24 @@ class GPUCPUTransferWorker(TransferWorkerBase):
             # block ids are read against the pool they belong to. share_mode is
             # what used to be TPTransferThreadGroup's job: with it carried per
             # request, the single-KV-head case no longer has to fall back.
-            self.region_batch.submit(
-                make_requests(
-                    self.region_batch.num_regions,
-                    gpu_block_id_list,
-                    cpu_block_id_list,
-                    transfer_type == TransferType.H2D,
-                    transfer_num_cta=transfer_num_cta,
-                    use_ce_transfer=use_ce_transfer,
-                    share_mode=self._rank_share_mode,
-                    region_indices=pool.region_indices,
-                ),
-                launch_sync,
+            request_args = dict(
+                transfer_num_cta=transfer_num_cta,
+                use_ce_transfer=use_ce_transfer,
             )
+            block_args = (self.region_batch.num_regions, gpu_block_id_list,
+                          cpu_block_id_list, transfer_type == TransferType.H2D)
+            if pool.pool_id is PoolId.FULL_KV and self._cp_ranges:
+                requests = []
+                for region, start, count, owner in self._cp_ranges:
+                    requests.extend(make_requests(
+                        *block_args, **request_args, region_indices=[region],
+                        layer_id=start, layer_granularity=count,
+                        share_mode=self._cp_owner_mode, designated_rank=owner))
+            else:
+                requests = make_requests(
+                    *block_args, **request_args, share_mode=self._rank_share_mode,
+                    region_indices=pool.region_indices)
+            self.region_batch.submit(requests, launch_sync)
             if self._use_async_launch:
                 self.region_batch.wait_all_streams()
         elif self._is_per_group(pool):
@@ -1260,6 +1296,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):
                     # consumer would read a layer it was told was ready.
                     layer_granularity=self._completion.layer_granularity(1),
                 )[0]
+                if pool_id is PoolId.FULL_KV and self._cp_holders is not None:
+                    req.rank_share_mode = self._cp_owner_mode
+                    req.designated_rank = self._cp_holders[layer]
                 req.milestone_layer = layer
                 requests.append(req)
                 pool_of.append(pool_id)

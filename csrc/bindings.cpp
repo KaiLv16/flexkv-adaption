@@ -696,7 +696,8 @@ PYBIND11_MODULE(c_ext, m) {
       .value("ALL_WRITE", flexkv::RankShareMode::ALL_WRITE)
       .value("RANK0_ONLY", flexkv::RankShareMode::RANK0_ONLY)
       .value("LAYER_PARALLEL", flexkv::RankShareMode::LAYER_PARALLEL)
-      .value("RANK_ROTATE", flexkv::RankShareMode::RANK_ROTATE);
+      .value("RANK_ROTATE", flexkv::RankShareMode::RANK_ROTATE)
+      .value("CP_OWNER_ONLY", flexkv::RankShareMode::CP_OWNER_ONLY);
 
   // The Python side stores this mode as the config string it came from;
   // parsing it here (rather than mapping it in Python) keeps the accepted

@@ -201,11 +201,28 @@ class ModelConfig:
     layer_groups: Optional[List[LayerGroupSpec]] = None
 
     local_dp_size: Optional[int] = None
+    # Physical owner in worker rank order, indexed by original model layer.
+    h2d_layer_holders: Optional[Tuple[int, ...]] = None
+    # The coordinator keeps the global schema. Transfer workers pack a local projection.
+    layer_split_nodes: int = 1
+    layer_split_node: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Freeze mechanism: after post_init, ModelConfig must not be mutated
     # ------------------------------------------------------------------
     _frozen: bool = field(default=False, init=False, repr=False)
+
+    def remote_ports_for_node(self, node):
+        """A dedicated command/result/query channel for each CP fragment."""
+        if self.layer_split_nodes == 1:
+            return self.master_ports
+        ports = [int(p) for p in self.master_ports]
+        if len(ports) != 3 or len(set(ports)) != 3 or min(ports) < 1 or not 1 <= node < self.nnodes:
+            raise ValueError("Invalid CP remote node or master ports")
+        stride = max(ports) - min(ports) + 1
+        if max(ports) + (self.nnodes - 2) * stride > 65535:
+            raise ValueError("CP transfer manager port range exceeds 65535")
+        return tuple(str(p + (node - 1) * stride) for p in ports)
 
     def freeze(self) -> None:
         """Lock the config so that any subsequent __setattr__ raises an error."""
@@ -242,7 +259,12 @@ class ModelConfig:
                     f"nnodes={self.nnodes} * local_dp_size={self.local_dp_size} "
                     f"!= dp_size={self.dp_size}"
                 )
-        if self.nnodes_per_pp_rank > 2:
+        if self.layer_split_nodes > 1:
+            if (self.layer_split_nodes != self.nnodes or self.cp_size % self.nnodes
+                    or self.tp_size != 1 or self.pp_size != 1 or self.dp_size != 1):
+                raise ValueError("Cross-node CP fragments require one evenly distributed CP group")
+            self.remote_ports_for_node(1)
+        if self.nnodes_per_pp_rank > 2 and self.layer_split_nodes != self.nnodes:
             raise ValueError(
                 f"[ModelConfig] only support 2-nodes TP for now, but got "
                 f"nnodes_per_pp_rank={self.nnodes_per_pp_rank} "
@@ -774,6 +796,8 @@ class CacheConfig:
     mooncake_store_pp_size: int = 1
     mooncake_store_node_layer_start: int = 0
     mooncake_store_node_layer_end: int = 0
+    layer_split_nodes: int = 1
+    layer_split_node: int = 0
     mooncake_store_total_layers: int = 0
 
     # Stored for deferred recomputation when layer_groups become known
@@ -1138,6 +1162,13 @@ def block_size_in_bytes_for_cache(
     group's block compression. Otherwise fall back to the uniform per-PP-stage
     estimate from ``rank_info``.
     """
+    if (model_config.layer_split_nodes > 1 and model_config.layer_split_node is None
+            and model_config.h2d_layer_holders is not None and model_config.layer_groups):
+        from flexkv.common.cache_layer_split import node_groups
+
+        return max(block_size_in_bytes_for_cache(
+            replace(model_config, layer_groups=node_groups(model_config, node)[0], layer_split_node=node),
+            cache_config, rank_info) for node in range(model_config.nnodes))
     if model_config.layer_groups is not None:
         # Match KVCacheLayout._compute_kv_shape exactly.  Computing a rounded
         # per-token size first and multiplying it by tokens_per_block loses

@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from flexkv.integration.sglang.layer_split import resolve_layer_split
 from flexkv.integration.sglang.comm import (
     CMD_LAYERWISE,
     FlexKVComm,
@@ -228,6 +229,8 @@ class FlexKVConnector:
     """
 
     _chunked_namespace_supported = True
+    _cache_layer_split: bool = False
+    _invalidate_layer_split_cache = None
     _cache_layout_key = None
 
     def _cache_namespace(self, namespace):
@@ -237,7 +240,7 @@ class FlexKVConnector:
 
     @property
     def _coordinated_restore(self) -> bool:
-        return False
+        return self._cache_layer_split
 
     @property
     def supports_cache_namespace(self) -> bool:
@@ -264,7 +267,11 @@ class FlexKVConnector:
         pp_group: Any = None,
         attn_tp_group: Any = None,
         attn_cp_group: Any = None,
+        layer_split_plan: Any = None,
+        draft_kvcache: Any = None,
     ) -> None:
+        if draft_kvcache is not None:
+            raise NotImplementedError("This FlexKV adapter requires target-only KV; disable the draft model")
         self.page_size = int(page_size)
 
         # 1. Resolve FlexKV config from env + sglang server args.
@@ -367,54 +374,61 @@ class FlexKVConnector:
 
         pool = getattr(kvcache, "full_kv_pool", kvcache)
         self._validate_kv_pool_support(kvcache, pool, server_args)
-        kv_caches, indexer_group = self._resolve_kv_buffers(kvcache)
-        if (
-            not self._is_dsv4
-            and kv_caches
-            and kv_caches[0].ndim == 3
-            and self.model_config.kv_dim == 1
-            and self.model_config.num_kv_heads == 1
-        ):
-            sample_kv = kv_caches[0]
+        layer_split_requested = (getattr(server_args, "enable_dsa_cache_layer_split", False)
+                           or getattr(server_args, "enable_nsa_cache_layer_split", False))
+        if getattr(pool, "layer_shard_enabled", False) or (layer_split_requested and self.model_config.cp_size > 1):
+            kv_caches, indexer_group = self._resolve_cache_layer_split(
+                pool, layer_split_plan,
+                model_identity=(getattr(server_args, "model_path", None), getattr(server_args, "revision", None)))
+        else:
+            kv_caches, indexer_group = self._resolve_kv_buffers(kvcache)
             if (
-                sample_kv.dtype != self.model_config.dtype
-                or sample_kv.shape[2] != self.model_config.head_size
+                not self._is_dsv4
+                and kv_caches
+                and kv_caches[0].ndim == 3
+                and self.model_config.kv_dim == 1
+                and self.model_config.num_kv_heads == 1
             ):
-                model_config = replace(
-                    self.model_config,
-                    dtype=sample_kv.dtype,
-                    head_size=sample_kv.shape[2],
-                )
-                model_config.freeze()
-                self.model_config = self.flexkv_config.model_config = model_config
-                self.rank_info = replace(self.rank_info, model_config=model_config)
-            storage_format_tag = getattr(pool, "storage_format_tag", None)
-            if storage_format_tag is not None and self._cache_layout_key is None:
-                indexer_desc = (
-                    (
-                        indexer_group.layer_indices,
-                        str(indexer_group.buffers[0].dtype),
-                        indexer_group.buffers[0].shape[1],
+                sample_kv = kv_caches[0]
+                if (
+                    sample_kv.dtype != self.model_config.dtype
+                    or sample_kv.shape[2] != self.model_config.head_size
+                ):
+                    model_config = replace(
+                        self.model_config,
+                        dtype=sample_kv.dtype,
+                        head_size=sample_kv.shape[2],
                     )
-                    if indexer_group is not None
-                    else None
-                )
-                format_layout = (
-                    self.model_config.num_layers,
-                    self.page_size,
-                    str(sample_kv.dtype),
-                    sample_kv.shape[2],
-                    storage_format_tag,
-                    indexer_desc,
-                    (
-                        getattr(server_args, "model_path", None),
-                        getattr(server_args, "revision", None),
-                    ),
-                )
-                digest = hashlib.sha256(
-                    json.dumps(format_layout, default=str).encode()
-                ).hexdigest()
-                self._cache_layout_key = f"flexkv.format.v1.{digest}"
+                    model_config.freeze()
+                    self.model_config = self.flexkv_config.model_config = model_config
+                    self.rank_info = replace(self.rank_info, model_config=model_config)
+                storage_format_tag = getattr(pool, "storage_format_tag", None)
+                if storage_format_tag is not None and self._cache_layout_key is None:
+                    indexer_desc = (
+                        (
+                            indexer_group.layer_indices,
+                            str(indexer_group.buffers[0].dtype),
+                            indexer_group.buffers[0].shape[1],
+                        )
+                        if indexer_group is not None
+                        else None
+                    )
+                    format_layout = (
+                        self.model_config.num_layers,
+                        self.page_size,
+                        str(sample_kv.dtype),
+                        sample_kv.shape[2],
+                        storage_format_tag,
+                        indexer_desc,
+                        (
+                            getattr(server_args, "model_path", None),
+                            getattr(server_args, "revision", None),
+                        ),
+                    )
+                    digest = hashlib.sha256(
+                        json.dumps(format_layout, default=str).encode()
+                    ).hexdigest()
+                    self._cache_layout_key = f"flexkv.format.v1.{digest}"
         if self._swa_kv_pool is not None and self.cache_config.swa is not None:
             buffers = self._swa_kv_pool.kv_buffer
             snapshot_bytes = sum(
@@ -448,7 +462,7 @@ class FlexKVConnector:
         ):
             self._remote_process = TransferManagerOnRemote.create_process(
                 master_host=self.model_config.master_host,
-                master_ports=self.model_config.master_ports,
+                master_ports=self.model_config.remote_ports_for_node(self.rank_info.node_rank),
             )
             logger.info(
                 "[FlexKV] Launched TransferManagerOnRemote on node_rank=%d %s",
@@ -845,6 +859,15 @@ class FlexKVConnector:
             return bool(self._sync_ctx.all_reduce_min(int(local_ready)))
         return bool(local_ready)
 
+    def _slot_signature(self, slot_mapping: torch.Tensor, task_id: int = -1) -> bytes:
+        # DMA uses the first slot of each page. Hash only those slots, preserving
+        # their order. Layerwise already stages the mapping on the host.
+        pages = self._to_cpu_int64(slot_mapping[::self.page_size]).contiguous()
+        signature = hashlib.blake2b(pages.numpy(), digest_size=16)
+        signature.update(int(task_id).to_bytes(8, "little", signed=True))
+        signature.update(slot_mapping.numel().to_bytes(8, "little"))
+        return signature.digest()
+
     def release_pending(self, rid: str) -> None:
         """Cancel the task held by an earlier ``lookup_kv(rid=...)`` that
         won't be followed by a ``retrieve_kv`` (e.g. allocation failed)."""
@@ -918,6 +941,13 @@ class FlexKVConnector:
         return loaded
 
     def _retrieve_whole_kv(self, rid: str, slot_mapping: torch.Tensor) -> int:
+        if self._cache_layer_split:
+            fkv_task_id = self._pending_lookups.get(rid, -1)
+            slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
+            signature = self._slot_signature(slot_mapping_cpu, fkv_task_id)
+            if not self._sync_ctx.cp_agrees(signature):
+                self.release_pending(rid)
+                raise RuntimeError("Cache layer split ranks disagree on H2D slots or task")
         fkv_task_id = self._pending_lookups.pop(rid, -1)
         if fkv_task_id < 0:
             return 0
@@ -926,7 +956,10 @@ class FlexKVConnector:
         )
         load_start_ns = time.perf_counter_ns()
 
-        slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
+        if self._invalidate_layer_split_cache is not None:
+            self._invalidate_layer_split_cache()
+        if not self._cache_layer_split:
+            slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
         swa_slot_mapping = self._build_swa_slot_mapping(slot_mapping)
         swa_slots = 0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
 
@@ -1070,6 +1103,9 @@ class FlexKVConnector:
             "expected_signal_count": expected_signal_count,
             "error": selection_error,
         }
+        if self._cache_layer_split:
+            slot_signature = self._slot_signature(slot_mapping_cpu)
+            manifest["slot_signature"] = slot_signature
         if self._sync_ctx.needs_sync:
             manifest = self._sync_ctx.scatter(
                 manifest,
@@ -1100,6 +1136,8 @@ class FlexKVConnector:
                     "FlexKV layerwise slot-count mismatch: "
                     f"local={n}, leader={manifest.get('slot_count')}"
                 )
+            if self._cache_layer_split and manifest["slot_signature"] != slot_signature:
+                raise RuntimeError("Cache layer split ranks disagree on layerwise H2D slots")
             producer_id = int(manifest["producer_id"])
             expected_signal_count = int(manifest["expected_signal_count"])
             if not 0 <= producer_id < self.layer_done_counter.num_counters:
@@ -1118,6 +1156,8 @@ class FlexKVConnector:
                         f"local_expected={local_expected}, "
                         f"leader_expected={expected_signal_count}"
                     )
+            if not defer_launch and self._invalidate_layer_split_cache is not None:
+                self._invalidate_layer_split_cache()
         except Exception as exc:  # noqa: BLE001
             local_ok = 0
             local_error = str(exc)
@@ -1332,6 +1372,8 @@ class FlexKVConnector:
             if any(m.producer_id != producer_id for m in members):
                 raise RuntimeError("Layerwise batch spans multiple producer counters")
             self.layer_done_counter.validate_prepared_batch(task_ids, producer_id)
+            if self._invalidate_layer_split_cache is not None:
+                self._invalidate_layer_split_cache()
         except Exception as exc:
             local_error = str(exc)
         ready = int(local_error is None)
@@ -1503,16 +1545,30 @@ class FlexKVConnector:
         with self._store_profile_scope("flexkv.connector.store.tokens_to_numpy"):
             token_ids_np = np.asarray(token_ids, dtype=np.int64)
         n = len(token_ids_np)
-        if n != len(kv_indices):
+        slot_count = len(kv_indices)
+        aligned_len = n - n % self.page_size
+        if self._cache_layer_split:
+            # Every CP rank votes, including ranks with a short or invalid
+            # input. Only the whole-page prefix is eligible for DMA.
+            signature = None
+            if n == slot_count:
+                aligned_slots = kv_indices if aligned_len == n else kv_indices[:aligned_len]
+                signature = self._slot_signature(aligned_slots)
+            if not self._sync_ctx.cp_agrees(signature):
+                self._log_cache_op(
+                    context, "complete", "failed", direction="D2H",
+                    stage="preflight", error="Invalid or different D2H slots across cache layer split ranks",
+                )
+                return -1
+        elif n != slot_count:
             raise ValueError(
                 f"store_kv: token_ids has {n} entries but kv_indices "
-                f"has {len(kv_indices)} entries"
+                f"has {slot_count} entries"
             )
 
         # Page-align inputs *before* put_match so the FlexKV allocator
         # only reserves slots that line up with the slot_mapping we send.
-        if self.page_size > 1:
-            aligned_len = (n // self.page_size) * self.page_size
+        if self.page_size > 1 or self._cache_layer_split:
             if aligned_len == 0:
                 self._log_cache_op(
                     context,
@@ -2089,6 +2145,11 @@ class FlexKVConnector:
         ):
             return
         kvcache.register_layer_transfer_counter(self.layer_done_counter)
+        full = getattr(kvcache, "full_kv_pool", kvcache)
+        if self._cache_layer_split and full is not kvcache:
+            # Some wrappers clear the inner counter; its speculative broadcast
+            # also reads KV. Registration requires identical layer numbering.
+            full.register_layer_transfer_counter(self.layer_done_counter)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -2418,6 +2479,111 @@ class FlexKVConnector:
             layer_indices=tuple(active_layer_indices),
             logical_layer_count=len(buffers),
         )
+
+    def _resolve_cache_layer_split(self, pool, plan, model_identity=None):
+        model = self.model_config
+        group = self._sync_ctx.attn_cp_cpu_group
+        if group is None or group.size() != model.cp_size:
+            raise ValueError("Physical CP layer split requires the SGLang CP CPU group")
+        # Compare the actual byte geometry and owners before *any* process
+        # starts KVManager. A local registration error must stop peers too.
+        try:
+            from flexkv.c_ext import RankShareMode
+
+            if not GLOBAL_CONFIG_FROM_ENV.region_batch or not hasattr(RankShareMode, "CP_OWNER_ONLY"):
+                raise ValueError("Rebuild FlexKV with CP_OWNER_ONLY and enable FLEXKV_REGION_BATCH")
+            if (model.pp_size != 1 or model.tp_size != 1 or model.cp_size <= 1
+                    or model.effective_tp_size_per_node * model.nnodes != model.cp_size
+                    or model.kv_dim != 1 or model.num_kv_heads != 1
+                    or not self._sync_ctx.needs_sync or self._is_dsv4
+                    or self._swa_kv_pool is not None):
+                raise ValueError("Physical DSA split requires one contiguous CP group and one MLA head")
+            if GLOBAL_CONFIG_FROM_ENV.cpu_layout_type != KVCacheLayoutType.BLOCKFIRST:
+                raise ValueError("DSA KV plus indexer require a multi-group BLOCKFIRST host layout")
+            if (self.cache_config.enable_gds or os.getenv("FLEXKV_ENABLE_NVCOMP") == "1"
+                    or GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode == "all_write"):
+                raise ValueError("Physical CP split requires uncompressed GPU↔CPU transfers to shared host pages")
+            if model.nnodes > 1 and (
+                model.dp_size != 1 or model.instance_num != 1 or model.local_dp_size is not None
+                or GLOBAL_CONFIG_FROM_ENV.enable_radixshmem or not self.cache_config.enable_cpu
+                or self.cache_config.enable_ssd or self.cache_config.enable_kv_sharing
+                or getattr(self, "_chunked_prefetch", False)
+                or (self.cache_config.enable_remote and not self.cache_config.use_mooncake_store_backend)
+                or self.rank_info.node_rank != self.rank_info.effective_tp_rank // model.effective_tp_size_per_node
+            ):
+                raise ValueError("Cross-node physical CP requires contiguous CP nodes, private host L2 and optional Mooncake Store L3")
+            mapping = getattr(self._kvcache, "full_attention_layer_id_mapping", None)
+            if mapping is not None and mapping != {i: i for i in range(model.num_layers)}:
+                raise ValueError("CP wrapper remaps transformer layers; owner numbers are ambiguous")
+            invalidate = pool.invalidate_layer_split_cache
+            if not callable(invalidate):
+                raise ValueError("CP pool must invalidate broadcast scratch after a host restore")
+            rank = self.rank_info.effective_tp_rank
+            if torch.distributed.get_rank(group) != rank:
+                raise ValueError("Physical CP rank and transfer worker order disagree")
+            holders, kv, active, index = resolve_layer_split(
+                pool, self.page_size, rank, model.cp_size, model.num_layers, plan)
+            if index is not None:
+                indexer = _IndexerBufferGroup(tuple(index), active, model.num_layers)
+                specs = self._build_indexer_layer_group_specs(kv, indexer)
+            else:
+                indexer = None
+                specs = [
+                    LayerGroupSpec(
+                        num_layers=self.rank_info.num_layers_per_pp_stage,
+                        num_kv_heads=kv[0].shape[1],
+                        head_size=kv[0].shape[2],
+                        layer_indices=list(range(self.rank_info.num_layers_per_pp_stage)),
+                        compress_ratio=1,
+                        dtype=kv[0].dtype,
+                    )
+                ]
+            if model.layer_groups is not None and model.layer_groups != specs:
+                raise ValueError("Configured layer groups differ from the physical KV and indexer")
+            storage_format_tag = getattr(pool, "storage_format_tag", None)
+            index_sig = (tuple(index[0].shape), str(index[0].dtype)) if index is not None else None
+            signature = (holders, self.page_size, active, tuple(kv[0].shape), str(kv[0].dtype),
+                         index_sig, storage_format_tag)
+            error = None
+        except Exception as exc:
+            error, signature = str(exc), None
+        peers = [None] * group.size()
+        torch.distributed.all_gather_object(peers, (error, signature), group=group)
+        for rank, (error, _) in enumerate(peers):
+            if error is not None:
+                raise ValueError(f"Physical CP registration failed on rank {rank}: {error}")
+        if any(layout != signature for _, layout in peers):
+            raise ValueError("Physical CP layer ownership or cache geometry differs across ranks")
+
+        model = replace(model, layer_split_nodes=model.nnodes, h2d_layer_holders=holders, layer_groups=specs,
+                        dtype=kv[0].dtype, head_size=kv[0].shape[2])
+        model.freeze()
+        self.model_config = self.flexkv_config.model_config = model
+        self.rank_info = replace(self.rank_info, model_config=model)
+        self._invalidate_layer_split_cache = invalidate
+        self._cache_layer_split = True
+        self.sparse_indexer = bool(indexer is not None and len(active) != model.num_layers)
+        self.cache_config.layer_split_nodes = model.nnodes
+        if self.sparse_indexer or model.nnodes > 1 or storage_format_tag is not None:
+            # Equal-sized indexer groups can describe different model layers.
+            # Include the host byte schema in every L2/L3 lookup and write.
+            layout = (
+                model.num_layers,
+                self.page_size,
+                active,
+                str(kv[0].dtype),
+                kv[0].shape[2],
+                str(index[0].dtype) if index is not None else None,
+                index[0].shape[1] if index is not None else None,
+                model_identity,
+            )
+            if storage_format_tag is not None:
+                layout += (storage_format_tag,)
+            if model.nnodes > 1:
+                layout += (model.nnodes, holders)
+            digest = hashlib.sha256(json.dumps(layout).encode()).hexdigest()
+            self._cache_layout_key = f"flexkv.dsa.sparse.v1.{digest}"
+        return kv, indexer
 
     def _validate_kv_pool_support(
         self, kvcache: Any, pool: Any, server_args: Any
@@ -3065,6 +3231,14 @@ class FlexKVConnector:
                 gpu_layouts=[gpu_layout, indexer_layout],
                 handles_per_group=[list(kv_caches), list(indexer_buffers)],
             )
+        elif getattr(self, "_cache_layer_split", False) and self.model_config.layer_groups is not None:
+            self.tp_client.register_to_server(
+                kv_caches=kv_caches,
+                kv_layout=gpu_layout,
+                layer_groups=self.model_config.layer_groups,
+                gpu_layouts=[gpu_layout],
+                handles_per_group=[list(kv_caches)],
+            )
         else:
             self.tp_client.register_to_server(
                 kv_caches=kv_caches,
@@ -3306,7 +3480,7 @@ class FlexKVConnector:
                 num_counters = self.layer_done_counter.num_counters
                 metadata = struct.pack(
                     "iiii",
-                    self.rank_info.effective_tp_rank,
+                    self.rank_info.effective_tp_rank % self.model_config.effective_tp_size_per_node,
                     self.model_config.effective_tp_size_per_node,
                     self.rank_info.num_layers_per_pp_stage,
                     num_counters,

@@ -363,6 +363,7 @@ class TransferEngine:
             transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
             transfer_num_cta_d2h=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h,
             compressor=self._compressors["gpu_cpu"],
+            h2d_layer_holders=self.model_config.h2d_layer_holders,
             completion=completion,
             layerwise_eventfd_socket=layerwise_eventfd_socket,
             **self._get_multi_group_kwargs(worker_key),
